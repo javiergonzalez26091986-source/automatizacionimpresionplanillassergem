@@ -12,11 +12,12 @@ import tempfile
 import shutil
 import pandas as pd
 import re
+import io
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="🖨️")
 st.title("🖨️ Automatización de Planillas SERGEM")
-st.markdown("Sistema integral con auto-rotación, limpieza de bordes, estampado de CENCO y filtro de logos.")
+st.markdown("Sistema integral con auto-rotación, estampado de CENCO, filtro de logos y extracción anidada de ZIPs.")
 
 # --- CARGA DE DATOS Y MODELOS ---
 @st.cache_data
@@ -36,12 +37,10 @@ def cargar_modelo_ocr():
 def optimizar_imagen_para_impresion(imagen_pil):
     ancho, alto = imagen_pil.size
     
-    # 1. Auto-rotación a horizontal
     if alto > ancho:
         imagen_pil = imagen_pil.rotate(90, expand=True)
         ancho, alto = imagen_pil.size
         
-    # 2. Recorte de bordes inferiores (eliminar marcas de agua)
     recorte_inferior = int(alto * 0.03)
     caja_recorte = (0, 0, ancho, alto - recorte_inferior)
     return imagen_pil.crop(caja_recorte)
@@ -83,9 +82,13 @@ def extraer_adjuntos_de_eml(contenido_eml, directorio_salida):
     for part in msg.walk():
         if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
             continue
+            
         filename = part.get_filename()
         if filename:
-            if filename.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')):
+            ext_lower = filename.lower()
+            
+            # 1. Archivos directos (PDFs e Imágenes)
+            if ext_lower.endswith(('.pdf', '.jpeg', '.jpg', '.png')):
                 ruta_archivo = os.path.join(directorio_salida, filename)
                 contador = 1
                 while os.path.exists(ruta_archivo):
@@ -95,6 +98,32 @@ def extraer_adjuntos_de_eml(contenido_eml, directorio_salida):
                 with open(ruta_archivo, 'wb') as new_file:
                     new_file.write(part.get_payload(decode=True))
                 adjuntos.append(ruta_archivo)
+                
+            # 2. Extracción profunda: Archivos ZIP adjuntos dentro del correo (Ej. Descargas de WhatsApp)
+            elif ext_lower.endswith('.zip'):
+                zip_bytes = part.get_payload(decode=True)
+                try:
+                    with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zip_ref:
+                        for zip_filename in zip_ref.namelist():
+                            if zip_filename.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')):
+                                file_content = zip_ref.read(zip_filename)
+                                base_name = os.path.basename(zip_filename)
+                                if not base_name:  # Ignorar estructuras de carpetas dentro del zip
+                                    continue
+                                
+                                ruta_archivo = os.path.join(directorio_salida, base_name)
+                                contador = 1
+                                while os.path.exists(ruta_archivo):
+                                    nombre_base, ext = os.path.splitext(base_name)
+                                    ruta_archivo = os.path.join(directorio_salida, f"{nombre_base}_{contador}{ext}")
+                                    contador += 1
+                                    
+                                with open(ruta_archivo, 'wb') as f_out:
+                                    f_out.write(file_content)
+                                adjuntos.append(ruta_archivo)
+                except Exception as e:
+                    pass # Ignorar ZIPs corruptos para no detener el proceso general
+
     return adjuntos
 
 def procesar_archivo_comprimido(archivo_subido, directorio_salida):
@@ -131,7 +160,6 @@ def analizar_y_estandarizar(ruta_archivo, reader, temp_dir):
             for i, pagina in enumerate(paginas):
                 pagina_rgb = pagina.convert('RGB')
                 
-                # Filtro para ignorar páginas de PDF anormalmente pequeñas
                 ancho, alto = pagina_rgb.size
                 if ancho < 500 or alto < 500:
                     continue
@@ -149,8 +177,6 @@ def analizar_y_estandarizar(ruta_archivo, reader, temp_dir):
             img = Image.open(ruta_archivo).convert('RGB')
             ancho, alto = img.size
             
-            # --- FILTRO CLAVE: IGNORAR LOGOS DE FIRMAS DE CORREO ---
-            # Si la imagen es más pequeña que 500x500, asumimos que es un logo y lo saltamos
             if ancho < 500 or alto < 500:
                 return None, []
                 
@@ -196,8 +222,6 @@ if archivo_zimbra is not None:
             resultados_tabla = []
             todas_las_imagenes_impresion = []
             alertas = 0
-            
-            # Variable para contar cuántas planillas reales se procesaron
             planillas_reales = 0 
             
             for i, archivo in enumerate(adjuntos):
@@ -206,7 +230,6 @@ if archivo_zimbra is not None:
                 
                 cenco_detectado, imagenes_estandarizadas = analizar_y_estandarizar(archivo, reader, temp_dir)
                 
-                # --- NUEVO: Si devolvió una lista vacía (era un logo), pasamos al siguiente adjunto ---
                 if not imagenes_estandarizadas:
                     progress_bar.progress((i + 1) / len(adjuntos))
                     continue
@@ -234,16 +257,15 @@ if archivo_zimbra is not None:
                 gc.collect()
             
             status_text.text("¡Procesamiento y optimización completados!")
-            st.success(f"✅ Se analizaron {planillas_reales} planillas válidas con éxito (se ignoraron logos de correos).")
+            st.success(f"✅ Se analizaron {planillas_reales} planillas válidas con éxito.")
             
             if alertas > 0:
-                st.error(f"⚠️ Atención!: Hay {alertas} planilla(s) sin un número CENCO detectado.")
+                st.error(f"⚠️ Atención Doña Yesenia: Hay {alertas} planilla(s) sin un número CENCO detectado.")
             
             if resultados_tabla:
                 df_resultados = pd.DataFrame(resultados_tabla)
                 st.dataframe(df_resultados, use_container_width=True)
                 
-                # --- BOTÓN PARA EXCEL ---
                 excel_buffer = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
                 df_resultados.to_excel(excel_buffer.name, index=False)
                 
@@ -258,7 +280,6 @@ if archivo_zimbra is not None:
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
                 
-                # --- GENERACIÓN DE IMPRESIÓN EN BLOQUE ---
                 if todas_las_imagenes_impresion:
                     ruta_pdf_final = os.path.join(temp_dir, "Planillas_Listas_Para_Imprimir.pdf")
                     todas_las_imagenes_impresion[0].save(
