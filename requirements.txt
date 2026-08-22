@@ -1,6 +1,6 @@
 streamlit
 easyocr
 opencv-python-headless
-pdf2image
-Pillow
 numpy
+Pillow
+pdf2image
