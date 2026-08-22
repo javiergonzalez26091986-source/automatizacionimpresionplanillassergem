@@ -5,8 +5,7 @@ import zipfile
 import email
 from email import policy
 import easyocr
-import cv2
-import numpy as np
+import gc
 from PIL import Image
 from pdf2image import convert_from_path
 import tempfile
@@ -18,7 +17,6 @@ st.title("🖨️ Automatización de Planillas SERGEM")
 st.markdown("Sube el archivo exportado de Zimbra (.tgz o .zip) para procesar las planillas.")
 
 # --- FUNCIONES DE PROCESAMIENTO ---
-
 def extraer_adjuntos_de_eml(contenido_eml, directorio_salida):
     adjuntos = []
     msg = email.message_from_bytes(contenido_eml, policy=policy.default)
@@ -63,20 +61,21 @@ def procesar_archivo_comprimido(archivo_subido, directorio_salida):
 
 @st.cache_resource
 def cargar_modelo_ocr():
+    # Cargar solo cuando se necesite y mantener en caché
     return easyocr.Reader(['es'])
 
-def leer_cenco_easyocr(ruta_imagen_o_pdf, reader):
+def leer_cenco_easyocr(ruta_imagen_o_pdf, reader, temp_dir):
     """Convierte PDF a imagen si es necesario y aplica OCR buscando CENCO"""
     try:
         imagenes_a_procesar = []
         
-        # Si es un PDF, lo convertimos a imágenes (una por cada página)
+        # Si es un PDF, lo convertimos a imágenes y las guardamos en el temp_dir principal
         if ruta_imagen_o_pdf.lower().endswith('.pdf'):
-            paginas = convert_from_path(ruta_imagen_o_pdf, dpi=200)
-            for pagina in paginas:
-                temp_img = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-                pagina.save(temp_img.name, 'JPEG')
-                imagenes_a_procesar.append(temp_img.name)
+            paginas = convert_from_path(ruta_imagen_o_pdf, dpi=150) # DPI bajado a 150 para ahorrar memoria
+            for i, pagina in enumerate(paginas):
+                nombre_temp = os.path.join(temp_dir, f"pagina_temp_{i}_{os.urandom(4).hex()}.jpg")
+                pagina.save(nombre_temp, 'JPEG')
+                imagenes_a_procesar.append(nombre_temp)
         else:
             imagenes_a_procesar.append(ruta_imagen_o_pdf)
             
@@ -87,6 +86,10 @@ def leer_cenco_easyocr(ruta_imagen_o_pdf, reader):
                 if "CENCO" in texto.upper() or "CENC" in texto.upper():
                     cencos_encontrados.append(texto)
                     
+        # Liberar memoria de imágenes procesadas
+        del imagenes_a_procesar
+        gc.collect() 
+        
         if cencos_encontrados:
             return ", ".join(cencos_encontrados)
         return "No detectado"
@@ -94,7 +97,6 @@ def leer_cenco_easyocr(ruta_imagen_o_pdf, reader):
         return f"Error: {e}"
 
 # --- INTERFAZ PRINCIPAL ---
-
 archivo_zimbra = st.file_uploader("📂 Arrastra aquí el exporte de Zimbra (.tgz o .zip)", type=['tgz', 'zip', 'tar.gz'])
 
 if archivo_zimbra is not None:
@@ -107,6 +109,7 @@ if archivo_zimbra is not None:
             
         if not adjuntos_extraidos:
             st.warning("No se encontraron planillas adjuntas en los correos de este archivo.")
+            shutil.rmtree(temp_dir, ignore_errors=True)
         else:
             st.success(f"✅ Se extrajeron {len(adjuntos_extraidos)} planillas con éxito.")
             st.write("### 🔍 Análisis y Lectura OCR de Planillas")
@@ -119,7 +122,8 @@ if archivo_zimbra is not None:
                 nombre_archivo = os.path.basename(archivo)
                 status_text.text(f"Analizando: {nombre_archivo}")
                 
-                cenco_texto = leer_cenco_easyocr(archivo, reader)
+                # Pasamos el temp_dir para que las imágenes del PDF se guarden allí y se borren al final
+                cenco_texto = leer_cenco_easyocr(archivo, reader, temp_dir)
                 
                 resultados.append({
                     "Archivo": nombre_archivo,
@@ -131,4 +135,6 @@ if archivo_zimbra is not None:
             status_text.text("¡Análisis completado con éxito!")
             st.dataframe(resultados, use_container_width=True)
             
-        shutil.rmtree(temp_dir)
+            # Limpieza final de todo el directorio temporal
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            gc.collect()
