@@ -6,7 +6,7 @@ import email
 from email import policy
 import easyocr
 import gc
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 from pdf2image import convert_from_path
 import tempfile
 import shutil
@@ -16,7 +16,7 @@ import re
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="🖨️")
 st.title("🖨️ Automatización de Planillas SERGEM")
-st.markdown("Sistema integral con auto-rotación, limpieza de bordes y estampado de CENCO.")
+st.markdown("Sistema integral con auto-rotación, limpieza de bordes, estampado de CENCO y filtro de logos.")
 
 # --- CARGA DE DATOS Y MODELOS ---
 @st.cache_data
@@ -34,35 +34,24 @@ def cargar_modelo_ocr():
 
 # --- FUNCIONES AUXILIARES DE IMAGEN ---
 def optimizar_imagen_para_impresion(imagen_pil):
-    """
-    1. Rota la imagen a horizontal si está en vertical.
-    2. Recorta un 3% inferior para eliminar marcas de agua (ej. CamScanner).
-    """
     ancho, alto = imagen_pil.size
     
     # 1. Auto-rotación a horizontal
     if alto > ancho:
         imagen_pil = imagen_pil.rotate(90, expand=True)
-        ancho, alto = imagen_pil.size # Actualizar dimensiones tras rotar
+        ancho, alto = imagen_pil.size
         
     # 2. Recorte de bordes inferiores (eliminar marcas de agua)
-    # Recortamos el 3% inferior
     recorte_inferior = int(alto * 0.03)
     caja_recorte = (0, 0, ancho, alto - recorte_inferior)
-    imagen_recortada = imagen_pil.crop(caja_recorte)
-    
-    return imagen_recortada
+    return imagen_pil.crop(caja_recorte)
 
 def estampar_cenco_en_imagen(imagen_pil, cenco_texto):
-    """Dibuja el CENCO en la esquina superior derecha de la imagen."""
     if not cenco_texto:
         cenco_texto = "CENCO NO DETECTADO"
         
     dibujo = ImageDraw.Draw(imagen_pil)
-    
-    # Intentar cargar una fuente por defecto, si falla usar la básica
     try:
-        # Ajusta el tamaño de la fuente según el tamaño de la imagen (aprox 3% del alto)
         tamano_fuente = int(imagen_pil.size[1] * 0.03) 
         fuente = ImageFont.truetype("arial.ttf", tamano_fuente)
     except IOError:
@@ -70,24 +59,19 @@ def estampar_cenco_en_imagen(imagen_pil, cenco_texto):
         
     texto = f" CENCO DETECTADO: {cenco_texto} "
     
-    # Obtener dimensiones del texto para crear el fondo
     try:
         caja_texto = dibujo.textbbox((0, 0), texto, font=fuente)
         ancho_texto = caja_texto[2] - caja_texto[0]
         alto_texto = caja_texto[3] - caja_texto[1]
     except AttributeError:
-        # Fallback para versiones antiguas de PIL
         ancho_texto, alto_texto = dibujo.textsize(texto, font=fuente)
 
-    # Coordenadas (Esquina superior derecha con un pequeño margen)
     margen_x = 20
     margen_y = 20
     x = imagen_pil.size[0] - ancho_texto - margen_x
     y = margen_y
 
-    # Dibujar rectángulo de fondo (Blanco)
     dibujo.rectangle((x, y, x + ancho_texto, y + alto_texto + 10), fill="white", outline="black", width=2)
-    # Dibujar texto (Rojo)
     dibujo.text((x, y + 5), texto, fill="red", font=fuente)
     
     return imagen_pil
@@ -145,30 +129,43 @@ def analizar_y_estandarizar(ruta_archivo, reader, temp_dir):
         if ruta_archivo.lower().endswith('.pdf'):
             paginas = convert_from_path(ruta_archivo, dpi=150)
             for i, pagina in enumerate(paginas):
-                img_path = os.path.join(temp_dir, f"temp_ocr_{os.urandom(4).hex()}.jpg")
                 pagina_rgb = pagina.convert('RGB')
+                
+                # Filtro para ignorar páginas de PDF anormalmente pequeñas
+                ancho, alto = pagina_rgb.size
+                if ancho < 500 or alto < 500:
+                    continue
+                    
+                img_path = os.path.join(temp_dir, f"temp_ocr_{os.urandom(4).hex()}.jpg")
                 pagina_rgb.save(img_path, 'JPEG')
                 
                 resultados = reader.readtext(img_path)
                 cenco = extraer_numero_cenco(resultados)
                 if cenco: cencos_detectados.append(cenco)
                 
-                # Optimizar imagen (Rotar y recortar)
                 img_optimizada = optimizar_imagen_para_impresion(pagina_rgb)
                 imagenes_optimizadas.append(img_optimizada)
         else:
             img = Image.open(ruta_archivo).convert('RGB')
+            ancho, alto = img.size
+            
+            # --- FILTRO CLAVE: IGNORAR LOGOS DE FIRMAS DE CORREO ---
+            # Si la imagen es más pequeña que 500x500, asumimos que es un logo y lo saltamos
+            if ancho < 500 or alto < 500:
+                return None, []
+                
             resultados = reader.readtext(ruta_archivo)
             cenco = extraer_numero_cenco(resultados)
             if cenco: cencos_detectados.append(cenco)
             
-            # Optimizar imagen (Rotar y recortar)
             img_optimizada = optimizar_imagen_para_impresion(img)
             imagenes_optimizadas.append(img_optimizada)
             
+        if not imagenes_optimizadas:
+            return None, []
+            
         cenco_final = cencos_detectados[0] if cencos_detectados else None
         
-        # Estampar el CENCO final en todas las páginas optimizadas de este documento
         imagenes_finales = []
         for img_opt in imagenes_optimizadas:
             img_estampada = estampar_cenco_en_imagen(img_opt, cenco_final)
@@ -194,19 +191,27 @@ if archivo_zimbra is not None:
         if not adjuntos:
             st.warning("No se encontraron planillas adjuntas en los correos de este archivo.")
         else:
-            st.success(f"✅ Se analizaron {len(adjuntos)} documentos con éxito.")
-            
             progress_bar = st.progress(0)
             status_text = st.empty()
             resultados_tabla = []
             todas_las_imagenes_impresion = []
             alertas = 0
             
+            # Variable para contar cuántas planillas reales se procesaron
+            planillas_reales = 0 
+            
             for i, archivo in enumerate(adjuntos):
                 nombre_archivo = os.path.basename(archivo)
-                status_text.text(f"Optimizando y cruzando datos: {nombre_archivo}")
+                status_text.text(f"Evaluando: {nombre_archivo}")
                 
                 cenco_detectado, imagenes_estandarizadas = analizar_y_estandarizar(archivo, reader, temp_dir)
+                
+                # --- NUEVO: Si devolvió una lista vacía (era un logo), pasamos al siguiente adjunto ---
+                if not imagenes_estandarizadas:
+                    progress_bar.progress((i + 1) / len(adjuntos))
+                    continue
+                
+                planillas_reales += 1
                 todas_las_imagenes_impresion.extend(imagenes_estandarizadas)
                 
                 empresa_asignada = "No asignada (Validar)"
@@ -229,47 +234,48 @@ if archivo_zimbra is not None:
                 gc.collect()
             
             status_text.text("¡Procesamiento y optimización completados!")
+            st.success(f"✅ Se analizaron {planillas_reales} planillas válidas con éxito (se ignoraron logos de correos).")
             
             if alertas > 0:
-                st.error(f"⚠️ Atención Doña Yesenia: Hay {alertas} planilla(s) sin un número CENCO detectado.")
+                st.error(f"⚠️ Atención!: Hay {alertas} planilla(s) sin un número CENCO detectado.")
             
-            df_resultados = pd.DataFrame(resultados_tabla)
-            st.dataframe(df_resultados, use_container_width=True)
-            
-            # --- BOTÓN PARA EXCEL ---
-            # Convertimos el DataFrame a Excel en memoria para descargarlo
-            excel_buffer = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-            df_resultados.to_excel(excel_buffer.name, index=False)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                with open(excel_buffer.name, "rb") as excel_file:
-                    st.download_button(
-                        label="📊 Descargar Reporte en Excel",
-                        data=excel_file,
-                        file_name="Reporte_CENCOS_Cruzados.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-            
-            # --- GENERACIÓN DE IMPRESIÓN EN BLOQUE ---
-            if todas_las_imagenes_impresion:
-                ruta_pdf_final = os.path.join(temp_dir, "Planillas_Listas_Para_Imprimir.pdf")
-                todas_las_imagenes_impresion[0].save(
-                    ruta_pdf_final, 
-                    save_all=True, 
-                    append_images=todas_las_imagenes_impresion[1:]
-                )
+            if resultados_tabla:
+                df_resultados = pd.DataFrame(resultados_tabla)
+                st.dataframe(df_resultados, use_container_width=True)
                 
-                with col2:
-                    with open(ruta_pdf_final, "rb") as pdf_file:
+                # --- BOTÓN PARA EXCEL ---
+                excel_buffer = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+                df_resultados.to_excel(excel_buffer.name, index=False)
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    with open(excel_buffer.name, "rb") as excel_file:
                         st.download_button(
-                            label="🖨️ Descargar Todas las Planillas (PDF Único)",
-                            data=pdf_file,
-                            file_name="Planillas_SERGEM_Optimizadas.pdf",
-                            mime="application/pdf",
-                            type="primary"
+                            label="📊 Descargar Reporte en Excel",
+                            data=excel_file,
+                            file_name="Reporte_CENCOS_Cruzados.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
+                
+                # --- GENERACIÓN DE IMPRESIÓN EN BLOQUE ---
+                if todas_las_imagenes_impresion:
+                    ruta_pdf_final = os.path.join(temp_dir, "Planillas_Listas_Para_Imprimir.pdf")
+                    todas_las_imagenes_impresion[0].save(
+                        ruta_pdf_final, 
+                        save_all=True, 
+                        append_images=todas_las_imagenes_impresion[1:]
+                    )
+                    
+                    with col2:
+                        with open(ruta_pdf_final, "rb") as pdf_file:
+                            st.download_button(
+                                label="🖨️ Descargar Todas las Planillas (PDF Único)",
+                                data=pdf_file,
+                                file_name="Planillas_SERGEM_Optimizadas.pdf",
+                                mime="application/pdf",
+                                type="primary"
+                            )
             
         shutil.rmtree(temp_dir, ignore_errors=True)
         gc.collect()
