@@ -170,7 +170,7 @@ def analizar_y_estandarizar(ruta_archivo, reader, temp_dir):
         
         # Estampar el CENCO final en todas las páginas optimizadas de este documento
         imagenes_finales = []
-        for img_opt en imagenes_optimizadas:
+        for img_opt in imagenes_optimizadas:
             img_estampada = estampar_cenco_en_imagen(img_opt, cenco_final)
             imagenes_finales.append(img_estampada)
             
