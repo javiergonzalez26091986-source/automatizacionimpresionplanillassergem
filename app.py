@@ -1,133 +1,139 @@
 import streamlit as st
 import os
 import tarfile
+import zipfile
 import email
 from email import policy
 import easyocr
 import cv2
 import numpy as np
-from playwright.sync_api import sync_playwright
-import time
-import subprocess
+from PIL import Image
+import tempfile
+import shutil
 
-# --- INSTALACIÓN DEL NAVEGADOR (SIN SUDO) ---
-@st.cache_resource(show_spinner=False)
-def instalar_navegador():
-    # Instala solo el navegador Chromium, omitiendo las dependencias del SO
-    # Esto evita el error de permisos al desplegar en la nube
-    subprocess.run(["playwright", "install", "chromium"])
+# --- CONFIGURACIÓN DE LA PÁGINA ---
+st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="🖨️")
+st.title("🖨️ Automatización de Planillas SERGEM")
+st.markdown("Sube el archivo exportado de Zimbra (.tgz o .zip) para procesar las planillas.")
 
-instalar_navegador()
+# --- FUNCIONES DE PROCESAMIENTO ---
 
-# --- FUNCIONES DE SCRAPING Y EXTRACCIÓN ---
-def descargar_exporte_zimbra(usuario, password, fecha_inicio, fecha_fin):
-    ruta_descarga = "/tmp" if os.name != 'nt' else os.getcwd()
+def extraer_adjuntos_de_eml(contenido_eml, directorio_salida):
+    """Lee un archivo .eml y guarda sus adjuntos (PDFs o Imágenes)"""
+    adjuntos = []
+    msg = email.message_from_bytes(contenido_eml, policy=policy.default)
     
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
-        
-        try:
-            # 1. Iniciar sesión
-            page.goto("https://buzon.sergemsas.com/")
-            # Reemplaza 'username' y 'password' por los names reales que saques con el script de JS
-            page.fill("input[name='username']", usuario) 
-            page.fill("input[name='password']", password) 
-            # Reemplaza el selector del botón
-            page.click("button[type='submit']") 
-            page.wait_for_load_state("networkidle")
+    for part in msg.walk():
+        # Ignorar si es multipart o si no es un adjunto
+        if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
+            continue
             
-            # 2. Navegar a Importar/Exportar
-            page.click("text=Preferencias")
-            page.click("text=Importar/Exportar")
-            time.sleep(2) 
-            
-            # 3. Configurar parámetros de exporte
-            page.click("text=Configuración avanzada")
-            
-            # Ejemplo para desmarcar checkboxes (busca los IDs reales con el script de JS)
-            # page.uncheck("#id_del_checkbox_contactos")
-            # page.uncheck("#id_del_checkbox_agenda")
-            
-            str_inicio = fecha_inicio.strftime("%d/%m/%Y")
-            str_fin = fecha_fin.strftime("%d/%m/%Y")
-            # Reemplaza los selectores de las fechas
-            page.fill("input[name='start_date']", str_inicio) 
-            page.fill("input[name='end_date']", str_fin) 
-            
-            # 4. Descargar
-            with page.expect_download() as download_info:
-                page.click("button:has-text('Exportar')")
-            
-            download = download_info.value
-            archivo_final = os.path.join(ruta_descarga, download.suggested_filename)
-            download.save_as(archivo_final)
-            
-            browser.close()
-            return archivo_final
-            
-        except Exception as e:
-            browser.close()
-            st.error(f"Error en la automatización web: {e}")
-            return None
+        filename = part.get_filename()
+        if filename:
+            # Filtrar solo pdfs o imágenes comunes
+            if filename.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')):
+                ruta_archivo = os.path.join(directorio_salida, filename)
+                # Manejar nombres duplicados
+                contador = 1
+                while os.path.exists(ruta_archivo):
+                    nombre_base, ext = os.path.splitext(filename)
+                    ruta_archivo = os.path.join(directorio_salida, f"{nombre_base}_{contador}{ext}")
+                    contador += 1
+                    
+                with open(ruta_archivo, 'wb') as new_file:
+                    new_file.write(part.get_payload(decode=True))
+                adjuntos.append(ruta_archivo)
+    return adjuntos
 
-def procesar_tgz(ruta_tgz):
-    adjuntos_extraidos = []
-    directorio_extraccion = "planillas_extraidas"
-    os.makedirs(directorio_extraccion, exist_ok=True)
+def procesar_archivo_comprimido(archivo_subido, directorio_salida):
+    """Descomprime el archivo subido y extrae los adjuntos de los .eml"""
+    todos_los_adjuntos = []
     
-    with tarfile.open(ruta_tgz, "r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name.endswith(".eml"):
-                f = tar.extractfile(member)
-                if f is not None:
-                    msg = email.message_from_bytes(f.read(), policy=policy.default)
-                    for part in msg.walk():
-                        if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
-                            continue
+    # Manejar archivo .tgz
+    if archivo_subido.name.endswith('.tgz') or archivo_subido.name.endswith('.tar.gz'):
+        with tarfile.open(fileobj=archivo_subido, mode="r:gz") as tar:
+            for member in tar.getmembers():
+                if member.name.endswith(".eml"):
+                    f = tar.extractfile(member)
+                    if f is not None:
+                        adjuntos = extraer_adjuntos_de_eml(f.read(), directorio_salida)
+                        todos_los_adjuntos.extend(adjuntos)
                         
-                        filename = part.get_filename()
-                        if filename:
-                            ruta_archivo = os.path.join(directorio_extraccion, filename)
-                            with open(ruta_archivo, 'wb') as new_file:
-                                new_file.write(part.get_payload(decode=True))
-                            adjuntos_extraidos.append(ruta_archivo)
-                            
-    return adjuntos_extraidos
+    # Manejar archivo .zip (por si acaso Zimbra lo exporta así)
+    elif archivo_subido.name.endswith('.zip'):
+        with zipfile.ZipFile(archivo_subido, 'r') as zip_ref:
+            for filename in zip_ref.namelist():
+                if filename.endswith(".eml"):
+                    with zip_ref.open(filename) as f:
+                        adjuntos = extraer_adjuntos_de_eml(f.read(), directorio_salida)
+                        todos_los_adjuntos.extend(adjuntos)
+                        
+    return todos_los_adjuntos
 
-def leer_cenco_easyocr(ruta_imagen):
-    reader = easyocr.Reader(['es'])
-    resultados = reader.readtext(ruta_imagen)
-    for (bbox, texto, prob) in resultados:
-        if "CENCO" in texto.upper():
-            return texto 
-    return None
+@st.cache_resource
+def cargar_modelo_ocr():
+    # Inicializar EasyOCR solo una vez para optimizar memoria
+    return easyocr.Reader(['es'])
 
-# --- INTERFAZ DE STREAMLIT ---
-st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide")
-st.title("🖨️ Automatización de Planillas - Fase 1")
+def leer_cenco_easyocr(ruta_imagen, reader):
+    """Aplica OCR a la imagen buscando la palabra CENCO"""
+    try:
+        resultados = reader.readtext(ruta_imagen)
+        for (bbox, texto, prob) in resultados:
+            # Buscar variaciones comunes por la mala calidad de escaneo
+            if "CENCO" in texto.upper() or "CENC" in texto.upper():
+                return texto
+        return "No detectado"
+    except Exception as e:
+        return f"Error leyendo: {e}"
 
-with st.sidebar:
-    st.header("Credenciales Zimbra")
-    usuario = st.text_input("Usuario", value="planillas")
-    password = st.text_input("Contraseña", type="password")
+# --- INTERFAZ PRINCIPAL ---
 
-col1, col2 = st.columns(2)
-fecha_inicio = col1.date_input("Fecha de inicio")
-fecha_fin = col2.date_input("Fecha de fin")
+archivo_zimbra = st.file_uploader("📂 Arrastra aquí el exporte de Zimbra (.tgz o .zip)", type=['tgz', 'zip', 'tar.gz'])
 
-if st.button("Descargar y Procesar"):
-    if not password:
-        st.warning("Por favor, ingresa la contraseña en la barra lateral.")
-    else:
-        with st.spinner("Navegando en Zimbra y descargando correos... (Esto puede tardar unos minutos)"):
-            ruta_tgz = descargar_exporte_zimbra(usuario, password, fecha_inicio, fecha_fin)
+if archivo_zimbra is not None:
+    if st.button("🚀 Procesar Archivo", type="primary"):
+        reader = cargar_modelo_ocr()
+        
+        # Crear directorio temporal para los archivos
+        temp_dir = tempfile.mkdtemp()
+        
+        with st.spinner("📦 Descomprimiendo y extrayendo planillas de los correos..."):
+            adjuntos_extraidos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
             
-        if ruta_tgz:
-            with st.spinner("Descomprimiendo archivos y extrayendo adjuntos..."):
-                lista_archivos = procesar_tgz(ruta_tgz)
-                st.success(f"Se extrajeron {len(lista_archivos)} adjuntos.")
+        if not adjuntos_extraidos:
+            st.warning("No se encontraron planillas adjuntas en los correos de este archivo.")
+        else:
+            st.success(f"✅ Se extrajeron {len(adjuntos_extraidos)} planillas con éxito.")
             
-            with st.spinner("Iniciando fase de preparación para OCR..."):
-                st.info("Estructura base lista. Siguiente paso: procesar imágenes.")
+            st.write("### 🔍 Análisis de Planillas")
+            
+            # Mostrar progreso de OCR
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            resultados = []
+            
+            for i, archivo in enumerate(adjuntos_extraidos):
+                nombre_archivo = os.path.basename(archivo)
+                status_text.text(f"Analizando: {nombre_archivo}")
+                
+                # Por ahora, solo pasamos OCR si es imagen. Los PDF requieren conversión a imagen primero.
+                cenco_texto = "Pendiente procesar PDF a Imagen"
+                if archivo.lower().endswith(('.png', '.jpg', '.jpeg')):
+                     cenco_texto = leer_cenco_easyocr(archivo, reader)
+                
+                resultados.append({
+                    "Archivo": nombre_archivo,
+                    "CENCO Detectado": cenco_texto
+                })
+                
+                progress_bar.progress((i + 1) / len(adjuntos_extraidos))
+            
+            status_text.text("Análisis completado.")
+            
+            # Mostrar resultados en tabla
+            st.dataframe(resultados, use_container_width=True)
+            
+        # Limpiar directorio temporal después del proceso
+        shutil.rmtree(temp_dir)
