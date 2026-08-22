@@ -8,6 +8,7 @@ import easyocr
 import cv2
 import numpy as np
 from PIL import Image
+from pdf2image import convert_from_path
 import tempfile
 import shutil
 
@@ -19,21 +20,17 @@ st.markdown("Sube el archivo exportado de Zimbra (.tgz o .zip) para procesar las
 # --- FUNCIONES DE PROCESAMIENTO ---
 
 def extraer_adjuntos_de_eml(contenido_eml, directorio_salida):
-    """Lee un archivo .eml y guarda sus adjuntos (PDFs o Imágenes)"""
     adjuntos = []
     msg = email.message_from_bytes(contenido_eml, policy=policy.default)
     
     for part in msg.walk():
-        # Ignorar si es multipart o si no es un adjunto
         if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
             continue
             
         filename = part.get_filename()
         if filename:
-            # Filtrar solo pdfs o imágenes comunes
             if filename.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')):
                 ruta_archivo = os.path.join(directorio_salida, filename)
-                # Manejar nombres duplicados
                 contador = 1
                 while os.path.exists(ruta_archivo):
                     nombre_base, ext = os.path.splitext(filename)
@@ -46,10 +43,7 @@ def extraer_adjuntos_de_eml(contenido_eml, directorio_salida):
     return adjuntos
 
 def procesar_archivo_comprimido(archivo_subido, directorio_salida):
-    """Descomprime el archivo subido y extrae los adjuntos de los .eml"""
     todos_los_adjuntos = []
-    
-    # Manejar archivo .tgz
     if archivo_subido.name.endswith('.tgz') or archivo_subido.name.endswith('.tar.gz'):
         with tarfile.open(fileobj=archivo_subido, mode="r:gz") as tar:
             for member in tar.getmembers():
@@ -58,8 +52,6 @@ def procesar_archivo_comprimido(archivo_subido, directorio_salida):
                     if f is not None:
                         adjuntos = extraer_adjuntos_de_eml(f.read(), directorio_salida)
                         todos_los_adjuntos.extend(adjuntos)
-                        
-    # Manejar archivo .zip (por si acaso Zimbra lo exporta así)
     elif archivo_subido.name.endswith('.zip'):
         with zipfile.ZipFile(archivo_subido, 'r') as zip_ref:
             for filename in zip_ref.namelist():
@@ -67,25 +59,39 @@ def procesar_archivo_comprimido(archivo_subido, directorio_salida):
                     with zip_ref.open(filename) as f:
                         adjuntos = extraer_adjuntos_de_eml(f.read(), directorio_salida)
                         todos_los_adjuntos.extend(adjuntos)
-                        
     return todos_los_adjuntos
 
 @st.cache_resource
 def cargar_modelo_ocr():
-    # Inicializar EasyOCR solo una vez para optimizar memoria
     return easyocr.Reader(['es'])
 
-def leer_cenco_easyocr(ruta_imagen, reader):
-    """Aplica OCR a la imagen buscando la palabra CENCO"""
+def leer_cenco_easyocr(ruta_imagen_o_pdf, reader):
+    """Convierte PDF a imagen si es necesario y aplica OCR buscando CENCO"""
     try:
-        resultados = reader.readtext(ruta_imagen)
-        for (bbox, texto, prob) in resultados:
-            # Buscar variaciones comunes por la mala calidad de escaneo
-            if "CENCO" in texto.upper() or "CENC" in texto.upper():
-                return texto
+        imagenes_a_procesar = []
+        
+        # Si es un PDF, lo convertimos a imágenes (una por cada página)
+        if ruta_imagen_o_pdf.lower().endswith('.pdf'):
+            paginas = convert_from_path(ruta_imagen_o_pdf, dpi=200)
+            for pagina in paginas:
+                temp_img = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+                pagina.save(temp_img.name, 'JPEG')
+                imagenes_a_procesar.append(temp_img.name)
+        else:
+            imagenes_a_procesar.append(ruta_imagen_o_pdf)
+            
+        cencos_encontrados = []
+        for img_path in imagenes_a_procesar:
+            resultados = reader.readtext(img_path)
+            for (bbox, texto, prob) in resultados:
+                if "CENCO" in texto.upper() or "CENC" in texto.upper():
+                    cencos_encontrados.append(texto)
+                    
+        if cencos_encontrados:
+            return ", ".join(cencos_encontrados)
         return "No detectado"
     except Exception as e:
-        return f"Error leyendo: {e}"
+        return f"Error: {e}"
 
 # --- INTERFAZ PRINCIPAL ---
 
@@ -94,8 +100,6 @@ archivo_zimbra = st.file_uploader("📂 Arrastra aquí el exporte de Zimbra (.tg
 if archivo_zimbra is not None:
     if st.button("🚀 Procesar Archivo", type="primary"):
         reader = cargar_modelo_ocr()
-        
-        # Crear directorio temporal para los archivos
         temp_dir = tempfile.mkdtemp()
         
         with st.spinner("📦 Descomprimiendo y extrayendo planillas de los correos..."):
@@ -105,23 +109,17 @@ if archivo_zimbra is not None:
             st.warning("No se encontraron planillas adjuntas en los correos de este archivo.")
         else:
             st.success(f"✅ Se extrajeron {len(adjuntos_extraidos)} planillas con éxito.")
+            st.write("### 🔍 Análisis y Lectura OCR de Planillas")
             
-            st.write("### 🔍 Análisis de Planillas")
-            
-            # Mostrar progreso de OCR
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
             resultados = []
             
             for i, archivo in enumerate(adjuntos_extraidos):
                 nombre_archivo = os.path.basename(archivo)
                 status_text.text(f"Analizando: {nombre_archivo}")
                 
-                # Por ahora, solo pasamos OCR si es imagen. Los PDF requieren conversión a imagen primero.
-                cenco_texto = "Pendiente procesar PDF a Imagen"
-                if archivo.lower().endswith(('.png', '.jpg', '.jpeg')):
-                     cenco_texto = leer_cenco_easyocr(archivo, reader)
+                cenco_texto = leer_cenco_easyocr(archivo, reader)
                 
                 resultados.append({
                     "Archivo": nombre_archivo,
@@ -130,10 +128,7 @@ if archivo_zimbra is not None:
                 
                 progress_bar.progress((i + 1) / len(adjuntos_extraidos))
             
-            status_text.text("Análisis completado.")
-            
-            # Mostrar resultados en tabla
+            status_text.text("¡Análisis completado con éxito!")
             st.dataframe(resultados, use_container_width=True)
             
-        # Limpiar directorio temporal después del proceso
         shutil.rmtree(temp_dir)
