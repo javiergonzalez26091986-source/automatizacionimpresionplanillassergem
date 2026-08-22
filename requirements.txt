@@ -1,5 +1,4 @@
 streamlit
-playwright
 easyocr
 opencv-python-headless
 pdf2image
