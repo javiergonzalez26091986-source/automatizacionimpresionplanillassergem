@@ -1,6 +1,8 @@
 streamlit
-pillow
+easyocr
+opencv-python-headless
+numpy
+Pillow
 pdf2image
 pandas
 openpyxl
-google-generativeai
