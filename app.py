@@ -57,17 +57,21 @@ def orientar_y_leer(imagen_pil, reader):
     # 1. Corregir rotación interna de celulares (EXIF)
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 2. Crear miniatura en Blanco y Negro SOLO para que el OCR lea rápido y sin fallos
+    # 2. MEJORA DE IMAGEN ANTES DEL OCR ("Belleza Facial" anticipada)
+    # Esto ayuda a que el OCR lea mucho mejor los números escritos a mano
+    imagen_pil = ImageEnhance.Brightness(imagen_pil).enhance(1.2)
+    imagen_pil = ImageEnhance.Contrast(imagen_pil).enhance(1.15)
+    
+    # 3. Crear miniatura en Blanco y Negro SOLO para que el OCR lea rápido
     img_ocr_base = imagen_pil.copy()
-    img_ocr_base.thumbnail((800, 800), Image.Resampling.LANCZOS)
-    img_ocr_base = img_ocr_base.convert('L') # Escala de grises mejora la lectura
+    img_ocr_base.thumbnail((1000, 1000), Image.Resampling.LANCZOS) # Aumentado un poco para mejor lectura
+    img_ocr_base = img_ocr_base.convert('L') 
 
-    # 3. Brújula de 4 direcciones: Buscar cuál es "Arriba"
+    # 4. Brújula de 4 direcciones: Buscar cuál es "Arriba"
     mejor_angulo = 0
     max_palabras = -1
     resultados_finales = []
     
-    # Palabras clave de la planilla SERGEM
     keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL", "TOTALES", "OBS", "PRODUCTO", "SALIDAS", "HORA", "DIA", "MES"]
     
     for angulo in [0, 90, 180, 270]:
@@ -86,10 +90,10 @@ def orientar_y_leer(imagen_pil, reader):
     del img_ocr_base, img_np
     gc.collect()
 
-    # 4. Rotar la imagen original de alta calidad al ángulo correcto
+    # 5. Rotar la imagen original de alta calidad al ángulo correcto
     imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
 
-    # 5. Extraer el CENCO del texto ya enderezado
+    # 6. Extraer el CENCO del texto ya enderezado
     cenco_final = "No detectado"
     texto_ganador = " ".join([res[1].upper() for res in resultados_finales])
     
@@ -99,18 +103,18 @@ def orientar_y_leer(imagen_pil, reader):
         if val not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'ABP', 'ABR', 'ABE', 'FIRMA']:
             cenco_final = val
     else:
-        # Búsqueda de rescate por proximidad si el escáner cortó la palabra
         textos = [res[1].upper() for res in resultados_finales]
         for i, txt in enumerate(textos):
-            if "CENC" in txt and i + 1 < len(textos):
-                posible = re.sub(r'[^A-Z0-9]', '', textos[i+1])
-                if 2 <= len(posible) <= 8 and posible not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA']:
-                    cenco_final = posible
+            if "CENC" in txt or "CEN" in txt:
+                sub_match = re.search(r'\d{3,}', txt)
+                if sub_match:
+                    cenco_final = sub_match.group()
                     break
-
-    # 6. Mejorar la imagen SOLO para impresión (Brillo y Contraste)
-    imagen_pil = ImageEnhance.Brightness(imagen_pil).enhance(1.2)
-    imagen_pil = ImageEnhance.Contrast(imagen_pil).enhance(1.15)
+                elif i + 1 < len(textos):
+                    posible = re.sub(r'[^A-Z0-9]', '', textos[i+1])
+                    if 2 <= len(posible) <= 10 and posible not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA', 'SERGEM']:
+                        cenco_final = posible
+                        break
 
     # 7. Recortar marca de agua inferior (ej. CamScanner)
     ancho, alto = imagen_pil.size
@@ -138,6 +142,12 @@ def orientar_y_leer(imagen_pil, reader):
     y = 20
     dibujo.rectangle((x, y, x + ancho_texto, y + alto_texto + 10), fill="white", outline="black", width=2)
     dibujo.text((x, y + 5), texto_sello, fill="red", font=fuente)
+    
+    # 9. FORZAR FORMATO HORIZONTAL PARA IMPRESIÓN
+    # Si después de enderezarla, la imagen es más alta que ancha, la rotamos 90 grados.
+    ancho_final, alto_final = imagen_pil.size
+    if alto_final > ancho_final:
+        imagen_pil = imagen_pil.rotate(90, expand=True)
     
     return imagen_pil, cenco_final
 
@@ -318,7 +328,7 @@ if not st.session_state.procesado:
 
 # --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
-    st.success(f"✅ ¡Procesamiento masivo finalizado! Se orientaron al derecho {st.session_state.planillas_reales} planillas con éxito.")
+    st.success(f"✅ ¡Procesamiento masivo finalizado! Se orientaron al derecho y se generaron {st.session_state.planillas_reales} planillas horizontales con éxito.")
     
     st.dataframe(st.session_state.df_resultados, use_container_width=True)
     
@@ -336,7 +346,7 @@ if st.session_state.procesado:
             st.download_button(
                 label="🖨️ Descargar Planillas Listas para Imprimir",
                 data=st.session_state.pdf_bytes,
-                file_name="Planillas_SERGEM_Alineadas.pdf",
+                file_name="Planillas_SERGEM_Alineadas_Horizontales.pdf",
                 mime="application/pdf",
                 type="primary"
             )
