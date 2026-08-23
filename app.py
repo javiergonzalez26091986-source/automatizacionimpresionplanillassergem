@@ -57,22 +57,18 @@ def orientar_y_leer(imagen_pil, reader):
     # 1. Corregir rotación interna de celulares (EXIF)
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 2. MEJORA DE IMAGEN ANTES DEL OCR ("Belleza Facial" anticipada)
-    # Esto ayuda a que el OCR lea mucho mejor los números escritos a mano
-    imagen_pil = ImageEnhance.Brightness(imagen_pil).enhance(1.2)
-    imagen_pil = ImageEnhance.Contrast(imagen_pil).enhance(1.15)
-    
-    # 3. Crear miniatura en Blanco y Negro SOLO para que el OCR lea rápido
+    # 2. Crear miniatura en Blanco y Negro SOLO para el OCR (SIN aclaración previa)
+    # Esto asegura que el IA vea el contraste original de la foto.
     img_ocr_base = imagen_pil.copy()
-    img_ocr_base.thumbnail((1000, 1000), Image.Resampling.LANCZOS) # Aumentado un poco para mejor lectura
+    img_ocr_base.thumbnail((1200, 1200), Image.Resampling.LANCZOS) 
     img_ocr_base = img_ocr_base.convert('L') 
 
-    # 4. Brújula de 4 direcciones: Buscar cuál es "Arriba"
+    # 3. Brújula de 4 direcciones: Buscar cuál es "Arriba"
     mejor_angulo = 0
     max_palabras = -1
     resultados_finales = []
     
-    keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL", "TOTALES", "OBS", "PRODUCTO", "SALIDAS", "HORA", "DIA", "MES"]
+    keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL", "TOTALES", "OBS", "PRODUCTO", "SALIDAS", "HORA", "DIA", "MES", "ABARROTES"]
     
     for angulo in [0, 90, 180, 270]:
         img_rotada = img_ocr_base.rotate(angulo, expand=True)
@@ -87,11 +83,22 @@ def orientar_y_leer(imagen_pil, reader):
             mejor_angulo = angulo
             resultados_finales = resultados
             
-    del img_ocr_base, img_np
+    # SEGURO HORIZONTAL: Si por mala calidad no detectó palabras, garantizamos que quede horizontal
+    if max_palabras <= 0:
+        if imagen_pil.size[1] > imagen_pil.size[0]:
+            mejor_angulo = 90
+            img_rotada = img_ocr_base.rotate(90, expand=True)
+            resultados_finales = reader.readtext(np.array(img_rotada))
+
+    del img_ocr_base
     gc.collect()
 
-    # 5. Rotar la imagen original de alta calidad al ángulo correcto
+    # 4. Rotar la imagen original de alta calidad al ángulo ganador
     imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
+    
+    # 5. AHORA SÍ: Aplicar "Belleza Facial" SOLO para la impresión final
+    imagen_pil = ImageEnhance.Brightness(imagen_pil).enhance(1.15)
+    imagen_pil = ImageEnhance.Contrast(imagen_pil).enhance(1.15)
 
     # 6. Extraer el CENCO del texto ya enderezado
     cenco_final = "No detectado"
@@ -103,6 +110,7 @@ def orientar_y_leer(imagen_pil, reader):
         if val not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'ABP', 'ABR', 'ABE', 'FIRMA']:
             cenco_final = val
     else:
+        # Búsqueda de rescate más agresiva
         textos = [res[1].upper() for res in resultados_finales]
         for i, txt in enumerate(textos):
             if "CENC" in txt or "CEN" in txt:
@@ -112,7 +120,7 @@ def orientar_y_leer(imagen_pil, reader):
                     break
                 elif i + 1 < len(textos):
                     posible = re.sub(r'[^A-Z0-9]', '', textos[i+1])
-                    if 2 <= len(posible) <= 10 and posible not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA', 'SERGEM']:
+                    if 2 <= len(posible) <= 10 and posible not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA', 'SERGEM', 'DIA']:
                         cenco_final = posible
                         break
 
@@ -143,10 +151,8 @@ def orientar_y_leer(imagen_pil, reader):
     dibujo.rectangle((x, y, x + ancho_texto, y + alto_texto + 10), fill="white", outline="black", width=2)
     dibujo.text((x, y + 5), texto_sello, fill="red", font=fuente)
     
-    # 9. FORZAR FORMATO HORIZONTAL PARA IMPRESIÓN
-    # Si después de enderezarla, la imagen es más alta que ancha, la rotamos 90 grados.
-    ancho_final, alto_final = imagen_pil.size
-    if alto_final > ancho_final:
+    # 9. ÚLTIMA VALIDACIÓN HORIZONTAL (Landscape Forzado)
+    if imagen_pil.size[1] > imagen_pil.size[0]:
         imagen_pil = imagen_pil.rotate(90, expand=True)
     
     return imagen_pil, cenco_final
