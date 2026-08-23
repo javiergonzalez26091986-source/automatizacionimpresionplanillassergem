@@ -4,28 +4,26 @@ import tarfile
 import zipfile
 import email
 from email import policy
+import easyocr
 import gc
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
 from pdf2image import convert_from_path
 import tempfile
 import shutil
 import pandas as pd
+import re
 import io
-import time
-import json
-import difflib
-import google.generativeai as genai
 
 # --- PROTECCIÓN PARA IMÁGENES MASIVAS ---
 Image.MAX_IMAGE_PIXELS = None 
 
-# --- INICIALIZAR MEMORIA DE STREAMLIT ---
+# --- INICIALIZAR MEMORIA DE STREAMLIT (Para que no se borre al descargar) ---
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
     st.session_state.pdf_bytes = None
     st.session_state.excel_bytes = None
     st.session_state.df_resultados = pd.DataFrame()
-    st.session_state.alertas = 0
     st.session_state.planillas_reales = 0
 
 def reiniciar_app():
@@ -33,18 +31,10 @@ def reiniciar_app():
     st.session_state.pdf_bytes = None
     st.session_state.excel_bytes = None
     st.session_state.df_resultados = pd.DataFrame()
-    st.session_state.alertas = 0
     st.session_state.planillas_reales = 0
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="sergemLogo.ico")
-
-# --- CONFIGURACIÓN DE GEMINI ---
-try:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
-except Exception:
-    st.error("⚠️ Falta configurar la GEMINI_API_KEY en los Secrets de Streamlit.")
 
 # --- ENCABEZADO CON LOGO ---
 col1, col2 = st.columns([1, 4])
@@ -55,185 +45,96 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Procesamiento inteligente con deducción por colaborador (Mensajero), cruce de ciudades y orientación perfecta.")
+    st.markdown("Orientación automática, aclarado de imágenes y extracción rápida de CENCO.")
 
-# --- CARGA DE DATOS ---
-@st.cache_data
-def cargar_base_datos(ruta_archivo="centrosDeCostos.xlsx"):
-    try:
-        df = pd.read_excel(ruta_archivo)
-        df.columns = df.columns.str.upper().str.strip()
-        
-        # Mapeo dinámico para acoplarse al Excel
-        col_cenco = 'CENTRO_COSTO' if 'CENTRO_COSTO' in df.columns else next((col for col in df.columns if 'CENCO' in col), None)
-        col_empresa = 'EMPRESA' if 'EMPRESA' in df.columns else next((col for col in df.columns if 'CLIENTE' in col), None)
-        col_ciudad = 'CIUDAD' if 'CIUDAD' in df.columns else next((col for col in df.columns if 'SUCURSAL' in col), None)
-        col_nombre = 'MENSAJERO' if 'MENSAJERO' in df.columns else next((col for col in df.columns if 'NOMBRE' in col or 'COLAB' in col), None)
+# --- CARGA DEL MODELO OCR ---
+@st.cache_resource
+def cargar_modelo_ocr():
+    return easyocr.Reader(['es'])
 
-        # Si alguna columna no existe en el excel, la creamos vacía para evitar errores
-        for col, default_name in zip([col_cenco, col_empresa, col_ciudad, col_nombre], ['CENCO_BD', 'CLIENTE_BD', 'CIUDAD_BD', 'NOMBRE_BD']):
-            if col not in df.columns:
-                df[default_name] = "No detectado"
-            else:
-                df = df.rename(columns={col: default_name})
-        
-        # Limpieza profunda de los textos del excel (Quita tabulaciones y espacios extra)
-        for col in ['CENCO_BD', 'CLIENTE_BD', 'CIUDAD_BD', 'NOMBRE_BD']:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.replace('\t', '').str.strip().str.upper()
-            
-        return df
-    except Exception as e:
-        return pd.DataFrame(columns=['CENCO_BD', 'CLIENTE_BD', 'CIUDAD_BD', 'NOMBRE_BD'])
-
-# --- FUNCIONES DE IA Y CRUCE INTELIGENTE ---
-def obtener_mejor_similitud_nombre(ocr_name, name_list):
-    """Algoritmo tolerante a errores ortográficos o nombres incompletos"""
-    if not ocr_name or ocr_name == "NO DETECTADO": return None
+# --- FUNCIONES DE MEJORA, LECTURA Y ORIENTACIÓN ---
+def mejorar_iluminacion(imagen_pil):
+    """Aclara las imágenes oscuras para que se impriman mejor"""
+    # Aumentar el brillo un 30%
+    brillo = ImageEnhance.Brightness(imagen_pil)
+    imagen_pil = brillo.enhance(1.3)
     
-    matches = difflib.get_close_matches(ocr_name, name_list, n=1, cutoff=0.6)
-    if matches:
-        return matches[0]
-        
-    ocr_parts = set(ocr_name.split())
-    best_match = None
-    best_score = 0
-    for name in name_list:
-        name_parts = set(name.split())
-        if not ocr_parts or not name_parts: continue
-        score = len(ocr_parts.intersection(name_parts)) / float(len(ocr_parts))
-        if score > best_score and score >= 0.5: 
-            best_score = score
-            best_match = name
-    return best_match
-
-def analizar_con_gemini(imagen_pil):
-    img_api = imagen_pil.copy()
-    img_api.thumbnail((1024, 1024), Image.Resampling.LANCZOS) 
+    # Aumentar el contraste un 20%
+    contraste = ImageEnhance.Contrast(imagen_pil)
+    imagen_pil = contraste.enhance(1.2)
     
-    prompt = """
-    Eres un asistente experto en lectura de documentos. Analiza esta planilla de 'Registro de Prestación de Servicios'.
-    Busca cuidadosamente los campos solicitados y devuelve estrictamente un objeto JSON con estas claves:
-    {
-        "NOMBRE": "Nombre completo del colaborador, mensajero o conductor. Suele estar junto a 'NOMBRE:'. Si no hay, pon 'No detectado'",
-        "CLIENTE": "Nombre de la empresa cliente (Ej: Covacrans, Exito, Olimpica, Surtimax). Busca el logo o la palabra junto a 'CLIENTE:'. Si no hay, pon 'No detectado'",
-        "SUCURSAL": "Ciudad o nombre de la sucursal. Si no hay, pon 'No detectado'",
-        "CENCO": "Número del centro de costo. Revisa bien la esquina superior derecha junto a 'CENCO:' o 'Código' (ej: 416, 30302, P-1234). Si está vacío o hay firmas que tapan el número, pon 'No detectado'",
-        "ESTA_DE_CABEZA": true o false (responde true SOLO si la planilla está girada y el texto principal se lee al revés/de cabeza)
-    }
-    """
+    return imagen_pil
+
+def extraer_numero_cenco(resultados):
+    texto_completo = " ".join([texto for (bbox, texto, prob) in resultados]).upper()
+    match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{2,10})', texto_completo)
     
-    for intento in range(4): 
-        try:
-            time.sleep(3.5) # Freno de seguridad para procesar quincenas sin bloquear la API
-            response = model.generate_content([prompt, img_api])
-            texto_respuesta = response.text
-            
-            if "```json" in texto_respuesta:
-                texto_respuesta = texto_respuesta.split("```json")[1].split("```")[0]
-            elif "```" in texto_respuesta:
-                texto_respuesta = texto_respuesta.split("```")[1].split("```")[0]
-                
-            return json.loads(texto_respuesta.strip())
-        except Exception:
-            time.sleep(5)
-            
-    return {"NOMBRE": "No detectado", "CLIENTE": "No detectado", "SUCURSAL": "No detectado", "CENCO": "No detectado", "ESTA_DE_CABEZA": False}
+    if match:
+        posible_cenco = match.group(1)
+        # Filtro estricto para no agarrar palabras de otros campos
+        falsos_positivos = ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'ABP', 'ABR', 'ABE', 'FIRMA', 'V', 'PRODUCTO']
+        if posible_cenco not in falsos_positivos:
+            return posible_cenco
+    return "No detectado"
 
-def cruzar_datos_inteligente(cenco_ocr, cliente_ocr, sucursal_ocr, nombre_ocr, df_base):
-    empresa_asignada = "No asignada (Validar)"
-    
-    cenco_cl = str(cenco_ocr).upper().strip()
-    cliente_cl = str(cliente_ocr).upper().strip()
-    sucursal_cl = str(sucursal_ocr).upper().strip()
-    nombre_cl = str(nombre_ocr).upper().strip()
-    
-    if df_base.empty:
-        return cenco_cl if cenco_cl not in ["NO DETECTADO", "NULL", "NONE", "VACÍO", ""] else "No detectado", "BD no cargada"
-
-    # 1. Búsqueda por CENCO explícito en la hoja
-    if cenco_cl and cenco_cl not in ["NO DETECTADO", "NULL", "NONE", "VACÍO", ""]:
-        coincidencia = df_base[df_base['CENCO_BD'] == cenco_cl]
-        if not coincidencia.empty:
-            return cenco_cl, coincidencia.iloc[0]['CLIENTE_BD']
-            
-        cenco_cl_clean = cenco_cl.replace("-", "").replace(" ", "")
-        coincidencia2 = df_base[df_base['CENCO_BD'].str.replace("-", "").str.replace(" ", "") == cenco_cl_clean]
-        if not coincidencia2.empty:
-            return coincidencia2.iloc[0]['CENCO_BD'], coincidencia2.iloc[0]['CLIENTE_BD']
-
-    cenco_final = "No detectado"
-
-    # 2. Búsqueda Detective: Deducción usando el Nombre del Colaborador (MENSAJERO)
-    if nombre_cl != "NO DETECTADO":
-        nombres_bd = df_base['NOMBRE_BD'].unique().tolist()
-        match_nombre = obtener_mejor_similitud_nombre(nombre_cl, nombres_bd)
-        
-        if match_nombre:
-            subset_emp = df_base[df_base['NOMBRE_BD'] == match_nombre]
-            
-            # Si el mensajero solo tiene un CENCO en toda la base, es ese
-            if len(subset_emp['CENCO_BD'].unique()) == 1:
-                return str(subset_emp.iloc[0]['CENCO_BD']), f"{subset_emp.iloc[0]['CLIENTE_BD']} (Por Colaborador)"
-            
-            # Si tiene varios clientes, filtramos por la ciudad
-            if sucursal_cl != "NO DETECTADO":
-                ciudades_emp = subset_emp['CIUDAD_BD'].unique().tolist()
-                match_ciudad = difflib.get_close_matches(sucursal_cl, ciudades_emp, n=1, cutoff=0.5)
-                if match_ciudad:
-                    fila = subset_emp[subset_emp['CIUDAD_BD'] == match_ciudad[0]].iloc[0]
-                    return str(fila['CENCO_BD']), f"{fila['CLIENTE_BD']} (Por Colab + Ciudad)"
-
-    # 3. Cruce por Cliente + Ciudad (Fallback)
-    if cliente_cl != "NO DETECTADO":
-        clientes_bd = df_base['CLIENTE_BD'].unique().tolist()
-        match_cliente = difflib.get_close_matches(cliente_cl, clientes_bd, n=1, cutoff=0.40)
-        
-        if match_cliente:
-            emp_match = match_cliente[0]
-            subset_cliente = df_base[df_base['CLIENTE_BD'] == emp_match]
-            
-            if sucursal_cl != "NO DETECTADO":
-                ciudades_cliente = subset_cliente['CIUDAD_BD'].unique().tolist()
-                match_ciudad = difflib.get_close_matches(sucursal_cl, ciudades_cliente, n=1, cutoff=0.5)
-                if match_ciudad:
-                    fila = subset_cliente[subset_cliente['CIUDAD_BD'] == match_ciudad[0]].iloc[0]
-                    cenco_res = str(fila['CENCO_BD'])
-                    return cenco_res if cenco_res != "NAN" else "No detectado", f"{emp_match} (Cruce Exacto)"
-                    
-            cenco_res = str(subset_cliente.iloc[0]['CENCO_BD'])
-            return cenco_res if cenco_res != "NAN" else "No detectado", f"{emp_match} (Sin ciudad exacta)"
-            
-    return "No detectado", empresa_asignada
-
-def optimizar_y_leer(imagen_pil, df_base):
+def optimizar_y_leer(imagen_pil, reader):
+    # 1. Corregir rotación interna de celulares
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 1. FORZAR HORIZONTAL SIEMPRE antes de la IA
+    # 2. Aclarar la imagen oscura
+    imagen_pil = mejorar_iluminacion(imagen_pil)
+    
+    # 3. Forzar Horizontal (Apaisado)
     ancho, alto = imagen_pil.size
     if alto > ancho:
         imagen_pil = imagen_pil.rotate(90, expand=True)
-        
-    # 2. Consultar a la IA
-    datos_ia = analizar_con_gemini(imagen_pil)
-    
-    # 3. Si la hoja horizontal quedó con el texto al revés (de cabeza), rotar 180 grados
-    if datos_ia.get("ESTA_DE_CABEZA", False):
-        imagen_pil = imagen_pil.rotate(180, expand=True)
 
-    # 4. Recorte inferior de marcas de escáner
+    # 4. Escudo de Memoria: Hacer copia pequeña solo para lectura OCR
+    img_ocr = imagen_pil.copy()
+    img_ocr.thumbnail((800, 800), Image.Resampling.LANCZOS) 
+    img_np = np.array(img_ocr)
+    
+    resultados = reader.readtext(img_np)
+    
+    # 5. Detección de orientación (Saber si está de cabeza)
+    keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL"]
+    y_coords = []
+    
+    for (bbox, texto, prob) in resultados:
+        if any(kw in texto.upper() for kw in keywords):
+            y_center = sum(p[1] for p in bbox) / 4
+            y_coords.append(y_center)
+            
+    necesita_rotar = False
+    if y_coords:
+        avg_y = sum(y_coords) / len(y_coords)
+        if avg_y > img_ocr.size[1] / 2: # Si las palabras clave están en la mitad de abajo, está al revés
+            necesita_rotar = True
+    else:
+        necesita_rotar = True # Si no pudo leer nada, seguro está al revés
+        
+    # 6. Girar 180° si es necesario y volver a leer
+    if necesita_rotar:
+        imagen_pil = imagen_pil.rotate(180, expand=True)
+        img_ocr_180 = img_ocr.rotate(180, expand=True)
+        del img_np
+        gc.collect()
+        
+        img_np = np.array(img_ocr_180)
+        resultados = reader.readtext(img_np)
+
+    # Extraer el CENCO
+    cenco_final = extraer_numero_cenco(resultados)
+    
+    del img_np, img_ocr
+    gc.collect()
+
+    # 7. Recorte del borde inferior (CamScanner)
     ancho, alto = imagen_pil.size
     recorte_inferior = int(alto * 0.03)
     imagen_pil = imagen_pil.crop((0, 0, ancho, alto - recorte_inferior))
     
-    cenco_base = datos_ia.get("CENCO", "No detectado")
-    cliente_base = datos_ia.get("CLIENTE", "No detectado")
-    nombre_base = datos_ia.get("NOMBRE", "No detectado")
-    sucursal_base = datos_ia.get("SUCURSAL", "No detectado")
-    
-    cenco_final, empresa_final = cruzar_datos_inteligente(cenco_base, cliente_base, sucursal_base, nombre_base, df_base)
-    
-    # --- ESTAMPADO ESTRICTO ---
+    # 8. Estampar el CENCO
     dibujo = ImageDraw.Draw(imagen_pil)
     try:
         tamano_fuente = int(imagen_pil.size[1] * 0.03) 
@@ -255,9 +156,9 @@ def optimizar_y_leer(imagen_pil, df_base):
     dibujo.rectangle((x, y, x + ancho_texto, y + alto_texto + 10), fill="white", outline="black", width=2)
     dibujo.text((x, y + 5), texto_sello, fill="red", font=fuente)
     
-    return imagen_pil, nombre_base, cenco_final, cliente_base, sucursal_base, empresa_final
+    return imagen_pil, cenco_final
 
-# --- EXTRACCIÓN MASIVA ---
+# --- EXTRACCIÓN MASIVA DE CORREOS Y ZIPs ---
 def extraer_adjuntos(contenido_bytes, directorio_salida, es_zip=False):
     adjuntos = []
     extensiones_validas = ('.pdf', '.jpeg', '.jpg', '.png', '.bmp', '.webp', '.tiff')
@@ -321,7 +222,7 @@ def procesar_archivo_comprimido(archivo_subido, directorio_salida):
                         todos_los_adjuntos.extend(extraer_adjuntos(f.read(), directorio_salida))
     return todos_los_adjuntos
 
-def procesar_documento(ruta_archivo, df_base, temp_dir):
+def procesar_documento(ruta_archivo, reader, temp_dir):
     rutas_optimizadas = []
     resultados = []
     try:
@@ -331,11 +232,11 @@ def procesar_documento(ruta_archivo, df_base, temp_dir):
                 pagina_rgb = pagina.convert('RGB')
                 if pagina_rgb.size[0] < 500 or pagina_rgb.size[1] < 500: continue
                 
-                img_final, nombre, cenco, cliente, sucursal, empresa = optimizar_y_leer(pagina_rgb, df_base)
+                img_final, cenco = optimizar_y_leer(pagina_rgb, reader)
                 ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
                 img_final.save(ruta_temp, 'JPEG', quality=85)
                 rutas_optimizadas.append(ruta_temp)
-                resultados.append((nombre, cenco, cliente, sucursal, empresa))
+                resultados.append(cenco)
                 
                 del pagina_rgb, img_final
                 gc.collect()
@@ -343,11 +244,11 @@ def procesar_documento(ruta_archivo, df_base, temp_dir):
             img = Image.open(ruta_archivo).convert('RGB')
             if img.size[0] < 500 or img.size[1] < 500: return [], []
             
-            img_final, nombre, cenco, cliente, sucursal, empresa = optimizar_y_leer(img, df_base)
+            img_final, cenco = optimizar_y_leer(img, reader)
             ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
             img_final.save(ruta_temp, 'JPEG', quality=85)
             rutas_optimizadas.append(ruta_temp)
-            resultados.append((nombre, cenco, cliente, sucursal, empresa))
+            resultados.append(cenco)
             
             del img, img_final
             gc.collect()
@@ -368,11 +269,12 @@ if not st.session_state.procesado:
     archivo_zimbra = st.file_uploader("📂 Arrastra aquí el exporte masivo de Zimbra (.tgz o .zip)", type=['tgz', 'zip', 'tar.gz'])
 
     if archivo_zimbra is not None:
-        if st.button("🚀 Procesar Quincena y Generar Reportes", type="primary"):
-            df_base = cargar_base_datos()
+        if st.button("🚀 Procesar Quincena", type="primary"):
+            
+            reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Extrayendo archivos, enderezando con IA y cruzando datos..."):
+            with st.spinner("📦 Extrayendo archivos y ajustando rotación e iluminación..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -383,34 +285,25 @@ if not st.session_state.procesado:
                 status_text = st.empty()
                 resultados_tabla = []
                 todas_las_rutas_impresion = []
-                alertas = 0
                 planillas_reales = 0 
                 
                 for i, archivo in enumerate(adjuntos):
                     nombre_archivo = os.path.basename(archivo)
-                    status_text.text(f"Evaluando como detective: {nombre_archivo}")
+                    status_text.text(f"Orientando y aclarando imagen: {nombre_archivo}")
                     
-                    rutas_est, datos_extraidos = procesar_documento(archivo, df_base, temp_dir)
+                    rutas_est, datos_extraidos = procesar_documento(archivo, reader, temp_dir)
                     
                     if not rutas_est:
                         progress_bar.progress((i + 1) / len(adjuntos))
                         continue
                     
-                    for dato in datos_extraidos:
+                    for idx, cenco in enumerate(datos_extraidos):
                         planillas_reales += 1
-                        todas_las_rutas_impresion.append(rutas_est[datos_extraidos.index(dato)])
+                        todas_las_rutas_impresion.append(rutas_est[idx])
                         
-                        nombre, cenco, cliente, sucursal, empresa = dato
-                        if cenco == "No detectado":
-                            alertas += 1
-                            
                         resultados_tabla.append({
                             "Documento": nombre_archivo,
-                            "Mensajero/Colab": nombre,
-                            "CENCO Final": cenco,
-                            "Cliente en Planilla": cliente,
-                            "Ciudad/Sucursal": sucursal,
-                            "Cliente Oficial (BD)": empresa
+                            "CENCO Extraído": cenco
                         })
                     
                     progress_bar.progress((i + 1) / len(adjuntos))
@@ -418,7 +311,6 @@ if not st.session_state.procesado:
                 
                 # --- GUARDAR RESULTADOS EN MEMORIA (STATE) ---
                 st.session_state.df_resultados = pd.DataFrame(resultados_tabla)
-                st.session_state.alertas = alertas
                 st.session_state.planillas_reales = planillas_reales
                 
                 # Excel a bytes
@@ -441,19 +333,16 @@ if not st.session_state.procesado:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 st.rerun()
 
-# --- VISTA DE RESULTADOS (Memoria permanente) ---
+# --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
-    st.success(f"✅ ¡Procesamiento masivo finalizado! Se orientaron y cruzaron {st.session_state.planillas_reales} planillas con éxito.")
-    
-    if st.session_state.alertas > 0:
-        st.warning(f"⚠️ {st.session_state.alertas} planilla(s) quedaron con 'CENCO: No detectado'. Verifica el Excel para ajustes manuales.")
+    st.success(f"✅ ¡Procesamiento masivo finalizado! Se orientaron y aclararon {st.session_state.planillas_reales} planillas con éxito.")
     
     st.dataframe(st.session_state.df_resultados, use_container_width=True)
     
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
-            label="📊 Descargar Reporte Completo (Excel)",
+            label="📊 Descargar Reporte (Excel)",
             data=st.session_state.excel_bytes,
             file_name="Reporte_Quincenal_SERGEM.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -462,9 +351,9 @@ if st.session_state.procesado:
     with col2:
         if st.session_state.pdf_bytes:
             st.download_button(
-                label="🖨️ Descargar Todas las Planillas",
+                label="🖨️ Descargar Planillas Listas para Imprimir",
                 data=st.session_state.pdf_bytes,
-                file_name="Planillas_SERGEM_Alineadas.pdf",
+                file_name="Planillas_SERGEM_Listas.pdf",
                 mime="application/pdf",
                 type="primary"
             )
