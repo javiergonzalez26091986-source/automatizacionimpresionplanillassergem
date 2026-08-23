@@ -13,6 +13,7 @@ import tempfile
 import shutil
 import re
 import io
+import pandas as pd # <--- ESTA ES LA LÍNEA QUE FALTABA
 
 # --- PROTECCIÓN PARA IMÁGENES MASIVAS ---
 Image.MAX_IMAGE_PIXELS = None 
