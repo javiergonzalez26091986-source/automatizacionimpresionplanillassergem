@@ -34,7 +34,7 @@ def reiniciar_app():
     st.session_state.planillas_reales = 0
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="sergemLogo.ico")
+st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="🖨️")
 
 col1, col2 = st.columns([1, 4])
 with col1:
@@ -44,12 +44,11 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática por volumen de texto y extracción cruda de CENCO.")
+    st.markdown("Brújula de confianza OCR, Lienzo Horizontal y Filtro Anti-Alucinaciones.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
 def cargar_modelo_ocr():
-    # Cargar el modelo una sola vez para ahorrar RAM
     return easyocr.Reader(['es'])
 
 # --- FUNCIONES DE LECTURA Y ORIENTACIÓN ---
@@ -57,68 +56,71 @@ def orientar_y_leer(imagen_pil, reader):
     # 1. Corregir rotación interna de celulares (EXIF)
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 2. BRÚJULA UNIVERSAL POR VOLUMEN DE TEXTO
-    # Usamos una miniatura para no agotar la RAM de Streamlit
+    # 2. BRÚJULA DE CONFIANZA
     img_brujula = imagen_pil.copy()
-    img_brujula.thumbnail((800, 800), Image.Resampling.NEAREST)
-    img_brujula = img_brujula.convert('L') # Blanco y negro natural, sin filtros
+    img_brujula.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+    img_brujula = img_brujula.convert('L')
     
     mejor_angulo = 0
-    max_caracteres = -1
+    max_score = -1
+    resultados_ganadores = []
     
     for angulo in [0, 90, 180, 270]:
         img_rotada = img_brujula.rotate(angulo, expand=True)
-        # detail=0 hace que EasyOCR sea súper rápido, solo devuelve el texto
-        textos_temp = reader.readtext(np.array(img_rotada), detail=0)
+        res = reader.readtext(np.array(img_rotada))
         
-        # Contamos cuántos caracteres legibles detectó en este ángulo
-        total_chars = sum(len(txt) for txt in textos_temp)
+        # EL SECRETO: Solo sumar letras si la IA está más de un 45% segura (prob > 0.45)
+        # Esto elimina firmas, rayones y ruido que leen al revés.
+        score = sum(len(texto) for bbox, texto, prob in res if prob > 0.45)
         
-        if total_chars > max_caracteres:
-            max_caracteres = total_chars
+        if score > max_score:
+            max_score = score
             mejor_angulo = angulo
+            resultados_ganadores = res
             
     del img_brujula
     gc.collect()
 
-    # 3. Rotar la imagen original de alta calidad al ángulo ganador
+    # 3. Rotar la imagen original al ángulo ganador real
     imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
 
-    # 4. LECTURA OFICIAL (Para buscar el CENCO en la imagen ya derecha)
-    # Cero filtros, cero alteraciones, leemos la imagen tal cual llegó
-    resultados_finales = reader.readtext(np.array(imagen_pil.convert('L')))
-
-    # 5. EXTRACCIÓN DE CENCO
+    # 4. EXTRACCIÓN DE CENCO (Filtro Anti-Alucinaciones)
     cenco_final = "No detectado"
-    texto_ganador = " ".join([res[1].upper() for res in resultados_finales])
+    # Solo usamos palabras con buena confianza
+    textos_confiables = [texto.upper() for bbox, texto, prob in resultados_ganadores if prob > 0.3]
+    texto_ganador = " ".join(textos_confiables)
     
-    # Busca explícitamente "CENCO" seguido de 2 a 10 caracteres
-    match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{2,10})', texto_ganador)
-    if match:
-        posible_cenco = match.group(1).strip()
-        if posible_cenco not in ['OBS', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA']:
-            cenco_final = posible_cenco
-    else:
-        # Búsqueda de rescate
-        textos = [res[1].upper() for res in resultados_finales]
-        for i, txt in enumerate(textos):
-            if "CENC" in txt or "CEN" in txt:
-                sub_match = re.search(r'\d{2,}', txt)
-                if sub_match:
-                    cenco_final = sub_match.group()
-                    break
-                elif i + 1 < len(textos):
-                    posible = re.sub(r'[^A-Z0-9]', '', textos[i+1])
-                    if len(posible) >= 2 and posible not in ['OBS', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA', 'SERGEM', 'DIA']:
-                        cenco_final = posible
-                        break
+    # Buscar explícitamente la palabra CENCO o CENC
+    for i, txt in enumerate(textos_confiables):
+        if "CENC" in txt or "CEN" in txt:
+            # Buscar número pegado a la palabra
+            match = re.search(r'\d{3,10}|[A-Z]\d{3}', txt)
+            if match:
+                cenco_final = match.group()
+            # Buscar en la siguiente palabra leída
+            elif i + 1 < len(textos_confiables):
+                siguiente = re.sub(r'[^A-Z0-9]', '', textos_confiables[i+1])
+                # Bloquear falsos positivos (Quincenas y basuras)
+                if len(siguiente) >= 3 and siguiente not in ['10115', '11631', '0115', '1631', 'OBS', 'MES', 'ANO', 'AÑO']:
+                    cenco_final = siguiente
+            break
 
-    # 6. Recortar marca de agua inferior (ej. CamScanner)
+    # 5. EL TRUCO DEL LIENZO (Forzar Horizontal sin acostar el texto)
     ancho, alto = imagen_pil.size
-    recorte_inferior = int(alto * 0.03)
-    imagen_pil = imagen_pil.crop((0, 0, ancho, alto - recorte_inferior))
+    if alto > ancho:
+        # En lugar de rotarla y dejar el texto de lado, creamos un fondo blanco horizontal
+        nuevo_ancho = int(alto * 1.3) # Proporción para que quede apaisada
+        canvas = Image.new('RGB', (nuevo_ancho, alto), 'white')
+        # Pegamos la planilla vertical en todo el centro
+        offset_x = (nuevo_ancho - ancho) // 2
+        canvas.paste(imagen_pil, (offset_x, 0))
+        imagen_pil = canvas
 
-    # 7. Estampar CENCO visible
+    # 6. Recortar marca de agua inferior y estampar
+    ancho_final, alto_final = imagen_pil.size
+    recorte_inferior = int(alto_final * 0.03)
+    imagen_pil = imagen_pil.crop((0, 0, ancho_final, alto_final - recorte_inferior))
+
     dibujo = ImageDraw.Draw(imagen_pil)
     try:
         tamano_fuente = int(imagen_pil.size[1] * 0.03) 
@@ -139,11 +141,6 @@ def orientar_y_leer(imagen_pil, reader):
     y = 20
     dibujo.rectangle((x, y, x + ancho_texto, y + alto_texto + 10), fill="white", outline="black", width=2)
     dibujo.text((x, y + 5), texto_sello, fill="red", font=fuente)
-    
-    # 8. GARANTÍA GEOMÉTRICA (Si es vertical, la acostamos sí o sí)
-    ancho_final, alto_final = imagen_pil.size
-    if alto_final > ancho_final:
-        imagen_pil = imagen_pil.rotate(90, expand=True)
     
     return imagen_pil, cenco_final
 
@@ -263,7 +260,7 @@ if not st.session_state.procesado:
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Analizando orientación de documentos..."):
+            with st.spinner("📦 Extrayendo archivos y orientando planillas con Inteligencia Artificial..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
