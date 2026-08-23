@@ -27,10 +27,10 @@ with col1:
     if os.path.exists("sergemLogo.png"):
         st.image("sergemLogo.png", width=180)
     else:
-        st.write("🏢 SERGEM") 
+        st.write("🏢 SERGEM") # Fallback por si no encuentra la imagen
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Sistema integral con auto-orientación espacial, filtro de firmas y escudo de memoria.")
+    st.markdown("Sistema integral con auto-orientación espacial, filtro de firmas y protección de CPU/RAM.")
 
 # --- CARGA DE DATOS Y MODELOS ---
 @st.cache_data
@@ -49,10 +49,12 @@ def cargar_modelo_ocr():
 # --- FUNCIONES DE LECTURA Y ORIENTACIÓN INTELIGENTE ---
 def extraer_numero_cenco(resultados):
     texto_completo = " ".join([texto for (bbox, texto, prob) in resultados]).upper()
+    # Busca la palabra CENC/CENCO y captura lo que haya inmediatamente después
     match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{1,10})', texto_completo)
     
     if match:
         posible_cenco = match.group(1)
+        # Filtro estricto: Si el campo está vacío, evita que agarre palabras cercanas
         falsos_positivos = ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'C', 'O', '0', 'ABP', 'ABR', 'ABE', 'FIRMA']
         if posible_cenco in falsos_positivos:
             return None
@@ -60,24 +62,28 @@ def extraer_numero_cenco(resultados):
     return None
 
 def optimizar_y_leer_cenco(imagen_pil, reader):
-    # 1. Corregir rotación interna (EXIF)
+    # 1. Corregir rotación interna (EXIF) de las cámaras
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # --- ESCUDO ANTI-CAÍDAS: Reducir imagen pesada a un máximo seguro ---
-    # Esto salva la RAM del servidor al aplicar OCR
+    # 2. Tamaño seguro para el PDF final (protección de RAM)
     imagen_pil.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
     
-    # 2. Forzar siempre a formato apaisado (horizontal)
+    # 3. Forzar siempre a formato apaisado (horizontal)
     ancho, alto = imagen_pil.size
     if alto > ancho:
         imagen_pil = imagen_pil.rotate(90, expand=True)
         ancho, alto = imagen_pil.size
 
-    # 3. Leer texto inicial para verificar dónde está el encabezado
-    img_np = np.array(imagen_pil)
+    # --- ESCUDO ANTI-CAÍDAS DE CPU (THROTTLING) ---
+    # Creamos una copia muy pequeña SOLO para el OCR
+    img_ocr = imagen_pil.copy()
+    img_ocr.thumbnail((800, 800), Image.Resampling.LANCZOS) 
+    img_np = np.array(img_ocr)
+    
+    # 4. Leer texto en la imagen en miniatura (ultrarrápido)
     resultados = reader.readtext(img_np)
     
-    # 4. Inteligencia Espacial
+    # 5. Inteligencia Espacial: Buscar coordenadas Y
     keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL"]
     y_coords = []
     
@@ -87,31 +93,36 @@ def optimizar_y_leer_cenco(imagen_pil, reader):
             y_coords.append(y_center)
             
     necesita_rotar = False
+    alto_ocr = img_ocr.size[1]
+    
     if y_coords:
         avg_y = sum(y_coords) / len(y_coords)
-        if avg_y > alto / 2:
+        if avg_y > alto_ocr / 2: # Si el promedio está en la mitad inferior, está al revés
             necesita_rotar = True
     else:
-        necesita_rotar = True 
+        necesita_rotar = True # Si no lee nada, probablemente esté de cabeza
 
-    # 5. Aplicar rotación de 180 grados si es necesario
+    # 6. Aplicar rotación de 180 grados si es necesario
     if necesita_rotar:
-        imagen_pil = imagen_pil.rotate(180, expand=True)
+        imagen_pil = imagen_pil.rotate(180, expand=True) # Rotamos la imagen de alta calidad
+        img_ocr_180 = img_ocr.rotate(180, expand=True)   # Rotamos la miniatura
         del img_np 
         gc.collect()
         
-        img_np = np.array(imagen_pil)
+        # Volvemos a leer la miniatura
+        img_np = np.array(img_ocr_180)
         resultados = reader.readtext(img_np)
 
     # Extraer el CENCO final validado
     cenco = extraer_numero_cenco(resultados)
     
-    del img_np
+    # Limpieza estricta
+    del img_np, img_ocr
     gc.collect()
     
-    # Recorte del borde inferior
-    recorte_inferior = int(alto * 0.03)
-    imagen_pil = imagen_pil.crop((0, 0, ancho, alto - recorte_inferior))
+    # Recorte del borde inferior (ej. CamScanner)
+    recorte_inferior = int(imagen_pil.size[1] * 0.03)
+    imagen_pil = imagen_pil.crop((0, 0, imagen_pil.size[0], imagen_pil.size[1] - recorte_inferior))
             
     return cenco, imagen_pil
 
@@ -157,6 +168,7 @@ def extraer_adjuntos_de_eml(contenido_eml, directorio_salida):
         if filename:
             ext_lower = filename.lower()
             
+            # Archivos sueltos
             if ext_lower.endswith(extensiones_validas):
                 ruta_archivo = os.path.join(directorio_salida, filename)
                 contador = 1
@@ -168,6 +180,7 @@ def extraer_adjuntos_de_eml(contenido_eml, directorio_salida):
                     new_file.write(part.get_payload(decode=True))
                 adjuntos.append(ruta_archivo)
                 
+            # ZIPs anidados de WhatsApp u otros
             elif ext_lower.endswith('.zip'):
                 zip_bytes = part.get_payload(decode=True)
                 try:
@@ -217,7 +230,7 @@ def analizar_y_estandarizar(ruta_archivo, reader, temp_dir):
     
     try:
         if ruta_archivo.lower().endswith('.pdf'):
-            paginas = convert_from_path(ruta_archivo, dpi=120)
+            paginas = convert_from_path(ruta_archivo, dpi=130)
             for pagina in paginas:
                 pagina_rgb = pagina.convert('RGB')
                 ancho, alto = pagina_rgb.size
@@ -229,6 +242,7 @@ def analizar_y_estandarizar(ruta_archivo, reader, temp_dir):
                 
                 img_final = estampar_cenco_en_imagen(img_optimizada, cenco)
                 
+                # Streaming de disco para no colapsar memoria
                 ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
                 img_final.save(ruta_temp, 'JPEG', quality=85)
                 rutas_imagenes_optimizadas.append(ruta_temp)
@@ -247,6 +261,7 @@ def analizar_y_estandarizar(ruta_archivo, reader, temp_dir):
             cenco_final = cencos_detectados[0] if cencos_detectados else None
             img_final = estampar_cenco_en_imagen(img_optimizada, cenco_final)
             
+            # Streaming de disco
             ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
             img_final.save(ruta_temp, 'JPEG', quality=85)
             rutas_imagenes_optimizadas.append(ruta_temp)
@@ -260,7 +275,6 @@ def analizar_y_estandarizar(ruta_archivo, reader, temp_dir):
         return None, []
 
 def generador_imagenes(rutas):
-    """Generador que carga las imágenes una por una para no saturar la RAM al armar el PDF"""
     for ruta in rutas:
         with Image.open(ruta) as img:
             yield img.convert('RGB')
@@ -277,7 +291,7 @@ if archivo_zimbra is not None:
         
         temp_dir = tempfile.mkdtemp()
         
-        with st.spinner("📦 Descomprimiendo, calculando orientación espacial y protegiendo memoria..."):
+        with st.spinner("📦 Descomprimiendo, calculando orientación espacial y protegiendo recursos..."):
             adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
             
         if not adjuntos:
@@ -293,7 +307,7 @@ if archivo_zimbra is not None:
             
             for i, archivo in enumerate(adjuntos):
                 nombre_archivo = os.path.basename(archivo)
-                status_text.text(f"Mapeando coordenadas y analizando: {nombre_archivo}")
+                status_text.text(f"Analizando: {nombre_archivo}")
                 
                 cenco_detectado, rutas_estandarizadas = analizar_y_estandarizar(archivo, reader, temp_dir)
                 
