@@ -7,7 +7,7 @@ from email import policy
 import easyocr
 import gc
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pdf2image import convert_from_path
 import tempfile
 import shutil
@@ -15,7 +15,7 @@ import re
 import io
 import pandas as pd
 
-# --- PROTECCIÓN PARA IMÁGENES MASIVAS ---
+# --- PROTECCIÓN PARA IMÁGENES MASIVAS Y MEMORIA ---
 Image.MAX_IMAGE_PIXELS = None 
 
 # --- INICIALIZAR MEMORIA DE STREAMLIT ---
@@ -89,80 +89,54 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática estricta y formato 100% apaisado.")
+    st.markdown("Orientación automática estricta, formato 100% apaisado y extracción de CENCO optimizada.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
 def cargar_modelo_ocr():
     return easyocr.Reader(['es'])
 
-# --- FUNCIONES NÚCLEO ---
-
-def detectar_orientacion_rapida(imagen_pil, reader):
-    """Brújula Turbo: Solo escanea lo necesario para ser veloz"""
-    img_test = imagen_pil.copy()
-    img_test.thumbnail((400, 400), Image.Resampling.LANCZOS)
-    img_test = img_test.convert('L')
-    
-    keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL", "TOTALES"]
-    mejor_angulo = 0
-    max_score = -1
-    
-    for angulo in [0, 90, 180, 270]:
-        img_rotada = img_test.rotate(angulo, expand=True)
-        # detail=0 hace que easyocr solo devuelva el texto plano, haciéndolo mucho más rápido
-        res = reader.readtext(np.array(img_rotada), detail=0) 
-        
-        texto_completo = " ".join(res).upper()
-        score = sum(1 for kw in keywords if kw in texto_completo)
-        
-        if score > max_score:
-            max_score = score
-            mejor_angulo = angulo
-            
-        # Si encuentra 3 palabras clave, ya sabemos que está al derecho. Rompemos el ciclo para ahorrar RAM.
-        if score >= 3: 
-            break
-            
-    del img_test
-    gc.collect()
-    return mejor_angulo
-
+# --- FUNCIONES DE LECTURA Y ORIENTACIÓN ---
 def extraer_cenco_espacial(resultados):
-    """Busca la palabra CENCO y captura lo que haya a su derecha"""
+    """Busca la palabra CENCO y captura el valor que está a su derecha"""
     cenco_val = "No detectado"
     cenco_y_center = None
     cenco_x_right = None
     
-    # 1. Buscar la palabra clave
+    # 1. Encontrar la coordenada de la palabra "CENCO"
     for bbox, texto, prob in resultados:
-        txt_upper = texto.upper()
+        txt_upper = str(texto).upper().strip()
         if "CENC" in txt_upper:
-            # Si lo leyó todo junto en el mismo cuadro ej: "CENCO: 416"
+            # Si lo leyó todo en el mismo cuadro (ej: "CENCO: 416")
             limpio = re.sub(r'[^A-Z0-9]', '', txt_upper.replace('CENCO', '').replace('CENC', ''))
-            if len(limpio) >= 2 and limpio not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL']:
+            if len(limpio) >= 2 and limpio not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'DESDES', 'CORTE']:
                 return limpio
             
-            # Guardar coordenadas para buscar al lado
+            # Guardamos las coordenadas para buscar a la derecha
             cenco_y_center = (bbox[0][1] + bbox[2][1]) / 2
             cenco_x_right = bbox[1][0]
             break
             
-    # 2. Buscar a la derecha usando las coordenadas
+    # 2. Buscar números a la derecha en el mismo renglón
     if cenco_y_center is not None:
         candidatos = []
         for bbox, texto, prob in resultados:
+            txt_upper = str(texto).upper().strip()
+            if "CENC" in txt_upper: 
+                continue
+            
             y_center = (bbox[0][1] + bbox[2][1]) / 2
             x_left = bbox[0][0]
             
-            # Si está en el mismo renglón (+/- 40 pixeles) y a la derecha
-            if abs(y_center - cenco_y_center) < 40 and x_left > cenco_x_right - 30:
-                txt_clean = re.sub(r'[^A-Z0-9]', '', texto.upper())
+            # Margen de error vertical (+/- 50 pixeles) y que esté a la derecha
+            if abs(y_center - cenco_y_center) < 50 and x_left > cenco_x_right - 20:
+                txt_clean = re.sub(r'[^A-Z0-9]', '', txt_upper)
+                # Filtramos basura común para asegurar que sea un CENCO
                 if len(txt_clean) >= 2 and txt_clean not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA']:
                     candidatos.append((x_left, txt_clean))
         
         if candidatos:
-            # Ordenar por el que esté más cerquita a la izquierda
+            # Ordenamos por cercanía a la palabra CENCO
             candidatos.sort(key=lambda x: x[0])
             cenco_val = candidatos[0][1]
             
@@ -171,33 +145,50 @@ def extraer_cenco_espacial(resultados):
 def orientar_y_leer(imagen_pil, reader):
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 1. Brújula rápida para ponerla al derecho
-    angulo = detectar_orientacion_rapida(imagen_pil, reader)
-    if angulo != 0:
-        imagen_pil = imagen_pil.rotate(angulo, expand=True)
-
-    # 2. Forzar Horizontal SIEMPRE
-    ancho, alto = imagen_pil.size
-    if alto > ancho:
-        imagen_pil = imagen_pil.rotate(90, expand=True)
-
-    # 3. Lectura OCR Final y Extracción Espacial
-    img_ocr = imagen_pil.copy()
-    img_ocr.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
-    img_ocr = img_ocr.convert('L')
+    # BRÚJULA PARA ENCONTRAR EL LADO CORRECTO
+    img_brujula = imagen_pil.copy()
+    img_brujula.thumbnail((800, 800), Image.Resampling.LANCZOS) # Más pequeño para ahorrar memoria
+    img_brujula = img_brujula.convert('L')
     
-    img_np = np.array(img_ocr)
-    resultados = reader.readtext(img_np)
-    cenco_final = extraer_cenco_espacial(resultados)
+    mejor_angulo = 0
+    max_score = -1
+    resultados_ganadores = []
     
-    del img_ocr, img_np
+    for angulo in [0, 90, 180, 270]:
+        img_rotada = img_brujula.rotate(angulo, expand=True)
+        img_np = np.array(img_rotada)
+        res = reader.readtext(img_np)
+        
+        # Calificación basada en confianza del texto
+        score = sum(len(texto) for bbox, texto, prob in res if prob > 0.45)
+        
+        if score > max_score:
+            max_score = score
+            mejor_angulo = angulo
+            resultados_ganadores = res
+            
+        del img_np, img_rotada # Limpieza de memoria agresiva en cada ciclo
+        gc.collect()
+            
+    del img_brujula
     gc.collect()
 
-    # 4. Mejorar iluminación SOLO para el PDF (Aclarado)
-    imagen_pil = ImageEnhance.Brightness(imagen_pil).enhance(1.15)
-    imagen_pil = ImageEnhance.Contrast(imagen_pil).enhance(1.2)
+    # Rotar la imagen original de alta calidad
+    imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
 
-    # 5. Recortar marca de agua y estampar
+    # EXTRACCIÓN ESPACIAL DEL CENCO
+    cenco_final = extraer_cenco_espacial(resultados_ganadores)
+
+    # EL TRUCO DEL LIENZO (Para forzar Horizontal sin distorsionar, rellenando con blanco)
+    ancho, alto = imagen_pil.size
+    if alto > ancho:
+        nuevo_ancho = int(alto * 1.3)
+        canvas = Image.new('RGB', (nuevo_ancho, alto), 'white')
+        offset_x = (nuevo_ancho - ancho) // 2
+        canvas.paste(imagen_pil, (offset_x, 0))
+        imagen_pil = canvas
+
+    # Recortar marca de agua y estampar
     ancho_final, alto_final = imagen_pil.size
     recorte_inferior = int(alto_final * 0.03)
     imagen_pil = imagen_pil.crop((0, 0, ancho_final, alto_final - recorte_inferior))
@@ -341,7 +332,7 @@ if not st.session_state.procesado:
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Analizando documentos a alta velocidad..."):
+            with st.spinner("📦 Analizando documentos optimizando la memoria RAM..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -395,9 +386,9 @@ if not st.session_state.procesado:
 
 # --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
-    st.success(f"✅ ¡Se procesaron, alinearon y aclararon {st.session_state.planillas_reales} planillas!")
+    st.success(f"✅ ¡Se procesaron y alinearon {st.session_state.planillas_reales} planillas con éxito!")
     
-    # Mostrar tabla directa en lugar de acordeón
+    # Mostrar tabla directa, sin índices visuales para más limpieza
     if not st.session_state.df_resultados.empty:
         st.dataframe(st.session_state.df_resultados, use_container_width=True, hide_index=True)
     
@@ -423,5 +414,5 @@ if st.session_state.procesado:
             )
             
     st.write("---")
-    if st.button("♻️ Procesar Nueva Quincena"):
+    if st.button("♻️ Subir nuevo archivo"):
         reiniciar_app()
