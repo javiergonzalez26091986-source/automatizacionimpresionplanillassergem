@@ -13,7 +13,7 @@ import tempfile
 import shutil
 import re
 import io
-import pandas as pd # <--- ESTA ES LA LÍNEA QUE FALTABA
+import pandas as pd
 
 # --- PROTECCIÓN PARA IMÁGENES MASIVAS ---
 Image.MAX_IMAGE_PIXELS = None 
@@ -37,19 +37,31 @@ st.set_page_config(page_title="Planillas SERGEM", layout="wide", page_icon="serg
 # --- ESTILOS CSS (Para que se vea bien en cualquier navegador) ---
 st.markdown("""
     <style>
-    /* Fondo principal y color de texto */
+    /* Fondo principal universal (Tema Claro) */
     .stApp {
-        background-color: #f4f6f9;
-        color: #1e1e1e;
+        background-color: #f4f6f9 !important;
     }
     /* Hacer transparente el header de Streamlit */
     [data-testid="stHeader"] {
-        background-color: rgba(244, 246, 249, 0);
+        background-color: rgba(244, 246, 249, 0) !important;
+    }
+    /* Forzar color de texto a oscuro para legibilidad */
+    h1, h2, h3, p, span, label, .stMarkdown {
+        color: #1e1e1e !important;
+    }
+    /* ARREGLO DEL BOTÓN DE CARGA DE ARCHIVOS */
+    [data-testid="stFileUploadDropzone"] {
+        background-color: #ffffff !important;
+        border: 2px dashed #a0a0a5 !important;
+        color: #1e1e1e !important;
+    }
+    [data-testid="stFileUploadDropzone"] * {
+        color: #1e1e1e !important;
     }
     /* Estilo corporativo para los botones primarios */
     .stButton>button {
         background-color: #e63946 !important;
-        color: white !important;
+        color: #ffffff !important;
         border-radius: 8px !important;
         border: none !important;
         padding: 10px 24px !important;
@@ -58,9 +70,12 @@ st.markdown("""
     .stButton>button:hover {
         background-color: #d62828 !important;
     }
-    /* Forzar visibilidad de textos */
-    h1, h2, h3, p, span, label, .stMarkdown {
-        color: #1e1e1e !important;
+    .stButton>button * {
+        color: #ffffff !important;
+    }
+    /* Arreglo para la tabla de datos */
+    [data-testid="stDataFrame"] {
+        background-color: #ffffff !important;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -74,7 +89,7 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática, forzado horizontal y extracción espacial de CENCO.")
+    st.markdown("Orientación automática estricta y formato 100% apaisado.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
@@ -95,7 +110,7 @@ def detectar_orientacion_rapida(imagen_pil, reader):
     
     for angulo in [0, 90, 180, 270]:
         img_rotada = img_test.rotate(angulo, expand=True)
-        # detail=0 hace que easyocr solo devuelva el texto plano, haciéndolo 3x más rápido
+        # detail=0 hace que easyocr solo devuelva el texto plano, haciéndolo mucho más rápido
         res = reader.readtext(np.array(img_rotada), detail=0) 
         
         texto_completo = " ".join(res).upper()
@@ -105,7 +120,7 @@ def detectar_orientacion_rapida(imagen_pil, reader):
             max_score = score
             mejor_angulo = angulo
             
-        # Si encuentra 3 palabras clave, ya sabemos que está al derecho. Rompemos el ciclo para ahorrar RAM y Tiempo.
+        # Si encuentra 3 palabras clave, ya sabemos que está al derecho. Rompemos el ciclo para ahorrar RAM.
         if score >= 3: 
             break
             
@@ -408,5 +423,5 @@ if st.session_state.procesado:
             )
             
     st.write("---")
-    if st.button("♻️ Subir nuevo archivo"):
+    if st.button("♻️ Procesar Nueva Quincena"):
         reiniciar_app()
