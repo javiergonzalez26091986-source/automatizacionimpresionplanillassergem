@@ -273,6 +273,10 @@ archivo_zimbra = st.file_uploader("📂 Arrastra aquí el exporte de Zimbra (.tg
 
 if archivo_zimbra is not None:
     if st.button("🚀 Procesar Archivo y Generar Bloque de Impresión", type="primary"):
+        # --- CARGA DE RECURSOS ---
+        df_base = cargar_base_datos()
+        reader = cargar_modelo_ocr()
+        
         temp_dir = tempfile.mkdtemp()
         
         with st.spinner("📦 Descomprimiendo, calculando orientación espacial y protegiendo memoria..."):
