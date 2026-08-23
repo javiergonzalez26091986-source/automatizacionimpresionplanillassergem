@@ -13,9 +13,10 @@ import tempfile
 import shutil
 import re
 
-# --- PROTECCIÓN Y BLINDAJE DE MEMORIA ---
+# --- PROTECCIÓN PARA IMÁGENES MASIVAS (ANTI-COLAPSO) ---
 Image.MAX_IMAGE_PIXELS = None 
 
+# --- INICIALIZAR MEMORIA DE STREAMLIT ---
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
     st.session_state.pdf_path = None
@@ -28,10 +29,10 @@ def reiniciar_app():
     st.session_state.planillas_reales = 0
     st.session_state.resumen = []
 
-# --- CONFIGURACIÓN DE PÁGINA E INTERFAZ ---
+# --- CONFIGURACIÓN DE LA PÁGINA E INTERFAZ PROFESIONAL ---
 st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="sergemLogo.ico")
 
-# --- CSS PERSONALIZADO (FONDO GRIS Y DISEÑO PROFESIONAL) ---
+# CSS para fondo gris y recuadros de resumen directo
 st.markdown("""
     <style>
     .stApp {
@@ -61,82 +62,60 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Procesamiento de alto rendimiento, orientación geométrica y lectura espacial estricta.")
+    st.markdown("Orientación automática estricta, formato 100% apaisado y extracción de CENCO.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
 def cargar_modelo_ocr():
     return easyocr.Reader(['es'])
 
-# --- LECTURA ESPACIAL Y ORIENTACIÓN ---
+# --- FUNCIONES DE LECTURA Y ORIENTACIÓN (TU LÓGICA ORIGINAL) ---
 def orientar_y_leer(imagen_pil, reader):
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 1. BRÚJULA (Rápida y de bajo consumo)
     img_brujula = imagen_pil.copy()
-    img_brujula.thumbnail((800, 800), Image.Resampling.LANCZOS)
+    img_brujula.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
     img_brujula = img_brujula.convert('L')
     
     mejor_angulo = 0
     max_score = -1
+    resultados_ganadores = []
     
+    # BRÚJULA DE CONFIANZA MEJORADA
     for angulo in [0, 90, 180, 270]:
         img_rotada = img_brujula.rotate(angulo, expand=True)
-        # detail=0 usa mínima memoria
-        textos_temp = reader.readtext(np.array(img_rotada), detail=0)
-        score = sum(len(txt) for txt in textos_temp if len(txt) > 2)
+        res = reader.readtext(np.array(img_rotada))
+        
+        score = sum(len(texto) for bbox, texto, prob in res if prob > 0.45)
         
         if score > max_score:
             max_score = score
             mejor_angulo = angulo
+            resultados_ganadores = res
             
     del img_brujula
     gc.collect()
 
-    # 2. ROTAR IMAGEN FINAL
+    # Rotar la imagen original
     imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
 
-    # 3. LECTURA ESPACIAL EXACTA (Sobre la imagen ya derecha)
-    img_ocr = imagen_pil.convert('L')
-    resultados = reader.readtext(np.array(img_ocr))
-    
+    # EXTRACCIÓN DE CENCO (Filtro estricto)
     cenco_final = "No detectado"
-    cajas_cenco = []
+    textos_confiables = [texto.upper() for bbox, texto, prob in resultados_ganadores if prob > 0.3]
     
-    # Buscar las coordenadas de la palabra CENCO
-    for bbox, text, prob in resultados:
-        if "CENC" in text.upper():
-            cajas_cenco.append(bbox)
-            
-    # Trazar línea a la derecha de la palabra
-    for cbox in cajas_cenco:
-        c_y_center = (cbox[0][1] + cbox[2][1]) / 2
-        c_x_right = max(cbox[1][0], cbox[2][0])
-        c_height = abs(cbox[2][1] - cbox[0][1])
-        
-        posibles = []
-        for bbox, text, prob in resultados:
-            text_limpio = re.sub(r'[^A-Z0-9]', '', text.upper())
-            if not text_limpio or "CENC" in text.upper(): continue
-            
-            y_center = (bbox[0][1] + bbox[2][1]) / 2
-            x_left = min(bbox[0][0], bbox[3][0])
-            
-            # Condición Espacial: A la derecha (tolerancia) y en la misma altura
-            if x_left > c_x_right - 15 and abs(y_center - c_y_center) < (c_height * 1.5):
-                posibles.append((x_left, text_limpio))
-                
-        if posibles:
-            posibles.sort(key=lambda x: x[0]) # El más cercano físicamente a la derecha
-            candidato = posibles[0][1]
-            if candidato not in ['OBS', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'CORTE', 'DESDE', 'HASTA']:
-                cenco_final = candidato
-                break
+    for i, txt in enumerate(textos_confiables):
+        if "CENC" in txt or "CEN" in txt:
+            match = re.search(r'\d{3,10}|[A-Z]\d{3}', txt)
+            if match:
+                cenco_final = match.group()
+            elif i + 1 < len(textos_confiables):
+                siguiente = re.sub(r'[^A-Z0-9]', '', textos_confiables[i+1])
+                # Filtro Anti-Alucinaciones de fechas
+                if len(siguiente) >= 3 and siguiente not in ['10115', '11631', '0115', '1631', 'OBS', 'MES', 'ANO', 'AÑO']:
+                    cenco_final = siguiente
+            break
 
-    del img_ocr
-    gc.collect()
-
-    # 4. EL TRUCO DEL LIENZO (Forzar Horizontal)
+    # EL TRUCO DEL LIENZO (Forzar Horizontal siempre)
     ancho, alto = imagen_pil.size
     if alto > ancho:
         nuevo_ancho = int(alto * 1.3)
@@ -145,7 +124,7 @@ def orientar_y_leer(imagen_pil, reader):
         canvas.paste(imagen_pil, (offset_x, 0))
         imagen_pil = canvas
 
-    # 5. RECORTAR Y ESTAMPAR
+    # Recortar marca de agua y estampar
     ancho_final, alto_final = imagen_pil.size
     recorte_inferior = int(alto_final * 0.03)
     imagen_pil = imagen_pil.crop((0, 0, ancho_final, alto_final - recorte_inferior))
@@ -173,7 +152,7 @@ def orientar_y_leer(imagen_pil, reader):
     
     return imagen_pil, cenco_final
 
-# --- EXTRACCIÓN Y PROCESAMIENTO MASIVO ---
+# --- EXTRACCIÓN MASIVA ---
 def extraer_adjuntos(contenido_bytes, directorio_salida, es_zip=False):
     adjuntos = []
     extensiones_validas = ('.pdf', '.jpeg', '.jpg', '.png')
@@ -196,7 +175,8 @@ def extraer_adjuntos(contenido_bytes, directorio_salida, es_zip=False):
                         with open(ruta_archivo, 'wb') as f_out:
                             f_out.write(file_content)
                         adjuntos.append(ruta_archivo)
-        except Exception: pass
+        except Exception:
+            pass
     else:
         msg = email.message_from_bytes(contenido_bytes, policy=policy.default)
         for part in msg.walk():
@@ -247,7 +227,7 @@ def procesar_documento(ruta_archivo, reader, temp_dir):
                 if pagina_rgb.size[0] < 500 or pagina_rgb.size[1] < 500: continue
                 
                 img_final, cenco = orientar_y_leer(pagina_rgb, reader)
-                # Escalar para ahorrar peso en el PDF final (Resolución apta para impresión A4)
+                # Escalar para ahorrar peso (Resolución A4 aprox)
                 img_final.thumbnail((1754, 1754), Image.Resampling.LANCZOS)
                 
                 ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
@@ -283,6 +263,7 @@ def generador_imagenes(rutas):
         gc.collect()
 
 # --- FLUJO PRINCIPAL ---
+
 if not st.session_state.procesado:
     archivo_zimbra = st.file_uploader("📂 Arrastra aquí el exporte masivo de Zimbra (.tgz o .zip)", type=['tgz', 'zip', 'tar.gz'])
 
@@ -292,7 +273,7 @@ if not st.session_state.procesado:
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Analizando documentos..."):
+            with st.spinner("📦 Analizando documentos... (Esto puede tomar unos minutos)"):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -311,7 +292,7 @@ if not st.session_state.procesado:
                         for idx, cenco in enumerate(cencos):
                             planillas_reales += 1
                             todas_las_rutas_impresion.append(rutas_est[idx])
-                            resumen.append(f"📄 Documento {planillas_reales} procesado exitosamente | CENCO Detectado: {cenco}")
+                            resumen.append(f"📄 Documento {planillas_reales} procesado | CENCO: {cenco}")
                     
                     progress_bar.progress((i + 1) / len(adjuntos))
                     gc.collect()
@@ -320,21 +301,20 @@ if not st.session_state.procesado:
                 st.session_state.resumen = resumen
                 
                 if todas_las_rutas_impresion:
-                    # BLINDAJE DE MEMORIA: Guardar PDF directamente en disco, no en RAM.
-                    ruta_pdf_final = os.path.join(temp_dir, "Planillas_SERGEM_Listas.pdf")
+                    # BLINDAJE: Guardamos el PDF en disco físico, no en RAM.
+                    ruta_pdf_final = os.path.join(temp_dir, "Planillas_SERGEM.pdf")
                     with Image.open(todas_las_rutas_impresion[0]) as primera_img:
                         primera_img_rgb = primera_img.convert('RGB')
                         if len(todas_las_rutas_impresion) > 1:
                             primera_img_rgb.save(ruta_pdf_final, format="PDF", save_all=True, append_images=generador_imagenes(todas_las_rutas_impresion[1:]))
                         else:
                             primera_img_rgb.save(ruta_pdf_final, format="PDF")
-                            
                     st.session_state.pdf_path = ruta_pdf_final
                 
                 st.session_state.procesado = True
                 st.rerun()
 
-# --- VISTA DE RESULTADOS (DISEÑO LIMPIO) ---
+# --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
     st.success(f"✅ ¡Se procesaron y alinearon {st.session_state.planillas_reales} planillas!")
     
@@ -344,7 +324,7 @@ if st.session_state.procesado:
     
     st.write("---")
     
-    if st.session_state.pdf_path and os.path.exists(st.session_state.pdf_path):
+    if getattr(st.session_state, 'pdf_path', None) and os.path.exists(st.session_state.pdf_path):
         with open(st.session_state.pdf_path, "rb") as pdf_file:
             st.download_button(
                 label="🖨️ Descargar Archivo para Imprimir",
@@ -357,7 +337,7 @@ if st.session_state.procesado:
             
     st.write("---")
     if st.button("♻️ Subir nuevo archivo"):
-        if st.session_state.pdf_path:
+        if getattr(st.session_state, 'pdf_path', None):
             shutil.rmtree(os.path.dirname(st.session_state.pdf_path), ignore_errors=True)
         reiniciar_app()
         st.rerun()
