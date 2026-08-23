@@ -4,8 +4,9 @@ import tarfile
 import zipfile
 import email
 from email import policy
-import pytesseract
+import easyocr
 import gc
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pdf2image import convert_from_path
 import tempfile
@@ -43,50 +44,74 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática inteligente, extracción directa de CENCO y formato apaisado.")
+    st.markdown("Orientación automática por volumen de texto y extracción cruda de CENCO.")
+
+# --- CARGA DEL MODELO OCR ---
+@st.cache_resource
+def cargar_modelo_ocr():
+    # Cargar el modelo una sola vez para ahorrar RAM
+    return easyocr.Reader(['es'])
 
 # --- FUNCIONES DE LECTURA Y ORIENTACIÓN ---
-def orientar_y_leer(imagen_pil):
-    # 1. Corregir rotación interna de la cámara (EXIF)
+def orientar_y_leer(imagen_pil, reader):
+    # 1. Corregir rotación interna de celulares (EXIF)
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 2. Rotación Inteligente con Tesseract OSD (Sin límite de palabras)
-    try:
-        # Convertimos temporalmente a escala de grises solo para que el OSD analice mejor
-        img_temp = imagen_pil.convert('L')
-        # Tesseract detecta la orientación geométrica del texto
-        osd_data = pytesseract.image_to_osd(img_temp)
-        angulo_rotacion = int(re.search(r'(?<=Rotate: )\d+', osd_data).group(0))
+    # 2. BRÚJULA UNIVERSAL POR VOLUMEN DE TEXTO
+    # Usamos una miniatura para no agotar la RAM de Streamlit
+    img_brujula = imagen_pil.copy()
+    img_brujula.thumbnail((800, 800), Image.Resampling.NEAREST)
+    img_brujula = img_brujula.convert('L') # Blanco y negro natural, sin filtros
+    
+    mejor_angulo = 0
+    max_caracteres = -1
+    
+    for angulo in [0, 90, 180, 270]:
+        img_rotada = img_brujula.rotate(angulo, expand=True)
+        # detail=0 hace que EasyOCR sea súper rápido, solo devuelve el texto
+        textos_temp = reader.readtext(np.array(img_rotada), detail=0)
         
-        # Si Tesseract dice que está volteada, la enderezamos
-        if angulo_rotacion != 0:
-            imagen_pil = imagen_pil.rotate(-angulo_rotacion, expand=True)
-    except Exception:
-        # Si la imagen es muy ruidosa y OSD falla, la dejamos pasar al siguiente filtro
-        pass 
+        # Contamos cuántos caracteres legibles detectó en este ángulo
+        total_chars = sum(len(txt) for txt in textos_temp)
+        
+        if total_chars > max_caracteres:
+            max_caracteres = total_chars
+            mejor_angulo = angulo
+            
+    del img_brujula
+    gc.collect()
 
-    # 3. REGLA DE ORO: Forzar Horizontal (Landscape)
-    # Si la altura es mayor que la anchura, la acostamos sí o sí.
-    ancho, alto = imagen_pil.size
-    if alto > ancho:
-        imagen_pil = imagen_pil.rotate(90, expand=True)
+    # 3. Rotar la imagen original de alta calidad al ángulo ganador
+    imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
 
-    # 4. Leer el texto de la imagen (Una sola pasada, usa mucha menos memoria)
-    texto_completo = ""
-    try:
-        texto_completo = pytesseract.image_to_string(imagen_pil, lang='spa').upper()
-    except Exception:
-        pass
+    # 4. LECTURA OFICIAL (Para buscar el CENCO en la imagen ya derecha)
+    # Cero filtros, cero alteraciones, leemos la imagen tal cual llegó
+    resultados_finales = reader.readtext(np.array(imagen_pil.convert('L')))
 
-    # 5. Extraer el CENCO
+    # 5. EXTRACCIÓN DE CENCO
     cenco_final = "No detectado"
-    # Busca explícitamente "CENCO" seguido del código
-    match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{3,10})', texto_completo)
+    texto_ganador = " ".join([res[1].upper() for res in resultados_finales])
+    
+    # Busca explícitamente "CENCO" seguido de 2 a 10 caracteres
+    match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{2,10})', texto_ganador)
     if match:
         posible_cenco = match.group(1).strip()
-        # Evitar falsos positivos comunes
         if posible_cenco not in ['OBS', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA']:
             cenco_final = posible_cenco
+    else:
+        # Búsqueda de rescate
+        textos = [res[1].upper() for res in resultados_finales]
+        for i, txt in enumerate(textos):
+            if "CENC" in txt or "CEN" in txt:
+                sub_match = re.search(r'\d{2,}', txt)
+                if sub_match:
+                    cenco_final = sub_match.group()
+                    break
+                elif i + 1 < len(textos):
+                    posible = re.sub(r'[^A-Z0-9]', '', textos[i+1])
+                    if len(posible) >= 2 and posible not in ['OBS', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA', 'SERGEM', 'DIA']:
+                        cenco_final = posible
+                        break
 
     # 6. Recortar marca de agua inferior (ej. CamScanner)
     ancho, alto = imagen_pil.size
@@ -114,6 +139,11 @@ def orientar_y_leer(imagen_pil):
     y = 20
     dibujo.rectangle((x, y, x + ancho_texto, y + alto_texto + 10), fill="white", outline="black", width=2)
     dibujo.text((x, y + 5), texto_sello, fill="red", font=fuente)
+    
+    # 8. GARANTÍA GEOMÉTRICA (Si es vertical, la acostamos sí o sí)
+    ancho_final, alto_final = imagen_pil.size
+    if alto_final > ancho_final:
+        imagen_pil = imagen_pil.rotate(90, expand=True)
     
     return imagen_pil, cenco_final
 
@@ -181,7 +211,7 @@ def procesar_archivo_comprimido(archivo_subido, directorio_salida):
                         todos_los_adjuntos.extend(extraer_adjuntos(f.read(), directorio_salida))
     return todos_los_adjuntos
 
-def procesar_documento(ruta_archivo, temp_dir):
+def procesar_documento(ruta_archivo, reader, temp_dir):
     rutas_optimizadas = []
     resultados = []
     try:
@@ -191,7 +221,7 @@ def procesar_documento(ruta_archivo, temp_dir):
                 pagina_rgb = pagina.convert('RGB')
                 if pagina_rgb.size[0] < 500 or pagina_rgb.size[1] < 500: continue
                 
-                img_final, cenco = orientar_y_leer(pagina_rgb)
+                img_final, cenco = orientar_y_leer(pagina_rgb, reader)
                 ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
                 img_final.save(ruta_temp, 'JPEG', quality=85)
                 rutas_optimizadas.append(ruta_temp)
@@ -203,7 +233,7 @@ def procesar_documento(ruta_archivo, temp_dir):
             img = Image.open(ruta_archivo).convert('RGB')
             if img.size[0] < 500 or img.size[1] < 500: return [], []
             
-            img_final, cenco = orientar_y_leer(img)
+            img_final, cenco = orientar_y_leer(img, reader)
             ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
             img_final.save(ruta_temp, 'JPEG', quality=85)
             rutas_optimizadas.append(ruta_temp)
@@ -230,9 +260,10 @@ if not st.session_state.procesado:
     if archivo_zimbra is not None:
         if st.button("🚀 Procesar Quincena", type="primary"):
             
+            reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Extrayendo archivos y orientando planillas..."):
+            with st.spinner("📦 Analizando orientación de documentos..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -249,7 +280,7 @@ if not st.session_state.procesado:
                     nombre_archivo = os.path.basename(archivo)
                     status_text.text(f"Orientando y leyendo: {nombre_archivo}")
                     
-                    rutas_est, datos_extraidos = procesar_documento(archivo, temp_dir)
+                    rutas_est, datos_extraidos = procesar_documento(archivo, reader, temp_dir)
                     
                     if not rutas_est:
                         progress_bar.progress((i + 1) / len(adjuntos))
