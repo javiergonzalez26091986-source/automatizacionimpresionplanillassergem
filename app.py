@@ -18,18 +18,16 @@ import io
 # --- PROTECCIÓN PARA IMÁGENES MASIVAS ---
 Image.MAX_IMAGE_PIXELS = None 
 
-# --- INICIALIZAR MEMORIA DE STREAMLIT (Para que no se borre al descargar) ---
+# --- INICIALIZAR MEMORIA DE STREAMLIT ---
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
     st.session_state.pdf_bytes = None
-    st.session_state.excel_bytes = None
     st.session_state.df_resultados = pd.DataFrame()
     st.session_state.planillas_reales = 0
 
 def reiniciar_app():
     st.session_state.procesado = False
     st.session_state.pdf_bytes = None
-    st.session_state.excel_bytes = None
     st.session_state.df_resultados = pd.DataFrame()
     st.session_state.planillas_reales = 0
 
@@ -45,96 +43,119 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática, aclarado de imágenes y extracción rápida de CENCO.")
+    st.markdown("Orientación automática perfecta, mejora de impresión y extracción rápida de CENCO.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
 def cargar_modelo_ocr():
     return easyocr.Reader(['es'])
 
-# --- FUNCIONES DE MEJORA, LECTURA Y ORIENTACIÓN ---
-def mejorar_iluminacion(imagen_pil):
-    """Aclara las imágenes oscuras para que se impriman mejor"""
-    # Aumentar el brillo un 30%
-    brillo = ImageEnhance.Brightness(imagen_pil)
-    imagen_pil = brillo.enhance(1.3)
+# --- FUNCIONES DE MEJORA Y LECTURA ---
+def mejorar_imagen_para_impresion(imagen_pil):
+    """Mejora la imagen solo para el PDF final (color y contraste) sin quemar el texto"""
+    enhancer = ImageEnhance.Contrast(imagen_pil)
+    imagen_pil = enhancer.enhance(1.15) # 15% más de contraste
     
-    # Aumentar el contraste un 20%
-    contraste = ImageEnhance.Contrast(imagen_pil)
-    imagen_pil = contraste.enhance(1.2)
+    enhancer2 = ImageEnhance.Color(imagen_pil)
+    imagen_pil = enhancer2.enhance(1.2) # 20% más de color/saturación
     
     return imagen_pil
 
-def extraer_numero_cenco(resultados):
-    texto_completo = " ".join([texto for (bbox, texto, prob) in resultados]).upper()
-    match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{2,10})', texto_completo)
+def extraer_cenco_de_resultados(resultados):
+    """Busca el CENCO en los resultados del OCR con alta precisión"""
+    textos = [res[1].upper() for res in resultados]
+    texto_completo = " ".join(textos)
     
+    # 1. Búsqueda general
+    match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{2,8})', texto_completo)
     if match:
-        posible_cenco = match.group(1)
-        # Filtro estricto para no agarrar palabras de otros campos
-        falsos_positivos = ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'ABP', 'ABR', 'ABE', 'FIRMA', 'V', 'PRODUCTO']
-        if posible_cenco not in falsos_positivos:
-            return posible_cenco
+        cenco = match.group(1).strip()
+        if cenco not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'ABP', 'ABR', 'ABE', 'FIRMA', 'PRODUCTO', 'DE']:
+            return cenco
+            
+    # 2. Búsqueda por proximidad (si el escáner partió la palabra y el número en dos)
+    for i, txt in enumerate(textos):
+        if "CENC" in txt:
+            # Revisar si el número quedó en el siguiente renglón
+            if i + 1 < len(textos):
+                posible_cenco = re.sub(r'[^A-Z0-9]', '', textos[i+1])
+                if 2 <= len(posible_cenco) <= 8 and posible_cenco not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA']:
+                    return posible_cenco
+                    
     return "No detectado"
 
 def optimizar_y_leer(imagen_pil, reader):
-    # 1. Corregir rotación interna de celulares
+    # 1. Corregir rotación interna de celulares (EXIF)
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 2. Aclarar la imagen oscura
-    imagen_pil = mejorar_iluminacion(imagen_pil)
-    
-    # 3. Forzar Horizontal (Apaisado)
+    # 2. FORZAR HORIZONTAL (Apaisado)
     ancho, alto = imagen_pil.size
     if alto > ancho:
         imagen_pil = imagen_pil.rotate(90, expand=True)
 
-    # 4. Escudo de Memoria: Hacer copia pequeña solo para lectura OCR
-    img_ocr = imagen_pil.copy()
-    img_ocr.thumbnail((800, 800), Image.Resampling.LANCZOS) 
-    img_np = np.array(img_ocr)
+    # 3. Preparar imagen EXCLUSIVA para el OCR (Escala de grises, sin filtros que lo confundan)
+    img_ocr = imagen_pil.convert('L')
+    img_ocr.thumbnail((1600, 1600), Image.Resampling.LANCZOS) 
     
+    # Leer texto
+    img_np = np.array(img_ocr)
     resultados = reader.readtext(img_np)
     
-    # 5. Detección de orientación (Saber si está de cabeza)
-    keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL"]
-    y_coords = []
+    # 4. VERIFICAR ORIENTACIÓN (Saber si está de cabeza - 180 grados)
+    y_coords_headers = []
+    y_coords_footers = []
     
     for (bbox, texto, prob) in resultados:
-        if any(kw in texto.upper() for kw in keywords):
-            y_center = sum(p[1] for p in bbox) / 4
-            y_coords.append(y_center)
+        txt_upper = texto.upper()
+        y_center = sum(p[1] for p in bbox) / 4
+        # Palabras de la parte superior
+        if any(kw in txt_upper for kw in ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE"]):
+            y_coords_headers.append(y_center)
+        # Palabras de la parte inferior
+        if any(kw in txt_upper for kw in ["TOTALES", "OBS", "PRODUCTO", "CAMBIOS"]):
+            y_coords_footers.append(y_center)
             
     necesita_rotar = False
-    if y_coords:
-        avg_y = sum(y_coords) / len(y_coords)
-        if avg_y > img_ocr.size[1] / 2: # Si las palabras clave están en la mitad de abajo, está al revés
+    alto_ocr = img_ocr.size[1]
+    
+    # Lógica de gravedad
+    if y_coords_headers:
+        avg_y = sum(y_coords_headers) / len(y_coords_headers)
+        if avg_y > (alto_ocr / 2): # Si el encabezado está en la mitad de abajo
             necesita_rotar = True
-    else:
-        necesita_rotar = True # Si no pudo leer nada, seguro está al revés
-        
-    # 6. Girar 180° si es necesario y volver a leer
+    elif y_coords_footers:
+        avg_y = sum(y_coords_footers) / len(y_coords_footers)
+        if avg_y < (alto_ocr / 2): # Si el pie de página está en la mitad de arriba
+            necesita_rotar = True
+    elif len(resultados) < 10: 
+        # Si casi no leyó texto, suele ser porque la imagen está totalmente al revés
+        necesita_rotar = True
+
+    # 5. Girar 180° si está de cabeza y volver a leer
     if necesita_rotar:
         imagen_pil = imagen_pil.rotate(180, expand=True)
-        img_ocr_180 = img_ocr.rotate(180, expand=True)
+        img_ocr = img_ocr.rotate(180, expand=True)
         del img_np
         gc.collect()
         
-        img_np = np.array(img_ocr_180)
+        img_np = np.array(img_ocr)
         resultados = reader.readtext(img_np)
 
-    # Extraer el CENCO
-    cenco_final = extraer_numero_cenco(resultados)
+    # 6. Extraer el CENCO
+    cenco_final = extraer_cenco_de_resultados(resultados)
     
     del img_np, img_ocr
     gc.collect()
 
-    # 7. Recorte del borde inferior (CamScanner)
+    # 7. MEJORAR IMAGEN PARA IMPRESIÓN (Ahora sí aplicamos el filtro)
+    imagen_pil = mejorar_imagen_para_impresion(imagen_pil)
+
+    # 8. Recorte del borde inferior (CamScanner)
     ancho, alto = imagen_pil.size
     recorte_inferior = int(alto * 0.03)
     imagen_pil = imagen_pil.crop((0, 0, ancho, alto - recorte_inferior))
     
-    # 8. Estampar el CENCO
+    # 9. Estampar el CENCO
     dibujo = ImageDraw.Draw(imagen_pil)
     try:
         tamano_fuente = int(imagen_pil.size[1] * 0.03) 
@@ -274,7 +295,7 @@ if not st.session_state.procesado:
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Extrayendo archivos y ajustando rotación e iluminación..."):
+            with st.spinner("📦 Extrayendo archivos, enderezando y aplicando OCR..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -289,7 +310,7 @@ if not st.session_state.procesado:
                 
                 for i, archivo in enumerate(adjuntos):
                     nombre_archivo = os.path.basename(archivo)
-                    status_text.text(f"Orientando y aclarando imagen: {nombre_archivo}")
+                    status_text.text(f"Orientando y leyendo: {nombre_archivo}")
                     
                     rutas_est, datos_extraidos = procesar_documento(archivo, reader, temp_dir)
                     
@@ -313,11 +334,6 @@ if not st.session_state.procesado:
                 st.session_state.df_resultados = pd.DataFrame(resultados_tabla)
                 st.session_state.planillas_reales = planillas_reales
                 
-                # Excel a bytes
-                excel_buffer = io.BytesIO()
-                st.session_state.df_resultados.to_excel(excel_buffer, index=False)
-                st.session_state.excel_bytes = excel_buffer.getvalue()
-                
                 # PDF a bytes
                 if todas_las_rutas_impresion:
                     pdf_buffer = io.BytesIO()
@@ -335,28 +351,18 @@ if not st.session_state.procesado:
 
 # --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
-    st.success(f"✅ ¡Procesamiento masivo finalizado! Se orientaron y aclararon {st.session_state.planillas_reales} planillas con éxito.")
+    st.success(f"✅ ¡Procesamiento masivo finalizado! Se orientaron al derecho {st.session_state.planillas_reales} planillas con éxito.")
     
     st.dataframe(st.session_state.df_resultados, use_container_width=True)
     
-    col1, col2 = st.columns(2)
-    with col1:
+    if st.session_state.pdf_bytes:
         st.download_button(
-            label="📊 Descargar Reporte (Excel)",
-            data=st.session_state.excel_bytes,
-            file_name="Reporte_Quincenal_SERGEM.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            label="🖨️ Descargar Todas las Planillas (Apaisadas y al derecho)",
+            data=st.session_state.pdf_bytes,
+            file_name="Planillas_SERGEM_Alineadas.pdf",
+            mime="application/pdf",
             type="primary"
         )
-    with col2:
-        if st.session_state.pdf_bytes:
-            st.download_button(
-                label="🖨️ Descargar Planillas Listas para Imprimir",
-                data=st.session_state.pdf_bytes,
-                file_name="Planillas_SERGEM_Listas.pdf",
-                mime="application/pdf",
-                type="primary"
-            )
             
     st.write("---")
     if st.button("♻️ Finalizar y Procesar Nueva Quincena"):
