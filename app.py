@@ -12,64 +12,40 @@ from pdf2image import convert_from_path
 import tempfile
 import shutil
 import re
+import io
 
-# --- PROTECCIÓN PARA IMÁGENES MASIVAS (ANTI-COLAPSO) ---
+# --- PROTECCIÓN PARA IMÁGENES MASIVAS ---
 Image.MAX_IMAGE_PIXELS = None 
 
 # --- INICIALIZAR MEMORIA DE STREAMLIT ---
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
-    st.session_state.pdf_path = None
+    st.session_state.pdf_bytes = None
     st.session_state.planillas_reales = 0
     st.session_state.resumen = []
 
 def reiniciar_app():
     st.session_state.procesado = False
-    st.session_state.pdf_path = None
+    st.session_state.pdf_bytes = None
     st.session_state.planillas_reales = 0
     st.session_state.resumen = []
 
-# --- CONFIGURACIÓN DE LA PÁGINA E INTERFAZ PROFESIONAL ---
-st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="sergemLogo.ico")
-
-# CSS para fondo gris y recuadros de resumen directo
-st.markdown("""
-    <style>
-    .stApp {
-        background-color: #e4e8ec;
-    }
-    .stApp, .stApp p, .stApp h1, .stApp h2, .stApp h3 {
-        color: #1a1c1e;
-    }
-    .summary-box {
-        background-color: #ffffff;
-        padding: 12px;
-        border-radius: 6px;
-        border-left: 5px solid #2e7bcf;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        margin-bottom: 8px;
-        color: #333333;
-        font-weight: 500;
-    }
-    </style>
-""", unsafe_allow_html=True)
+# --- CONFIGURACIÓN DE LA PÁGINA ---
+st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="🖨️")
 
 col1, col2 = st.columns([1, 4])
 with col1:
-    if os.path.exists("sergemLogo.png"):
-        st.image("sergemLogo.png", width=180)
-    else:
-        st.write("🏢 SERGEM")
+    st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática estricta, formato 100% apaisado y extracción de CENCO.")
+    st.markdown("Orientación automática estricta y formato 100% apaisado.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
 def cargar_modelo_ocr():
     return easyocr.Reader(['es'])
 
-# --- FUNCIONES DE LECTURA Y ORIENTACIÓN (TU LÓGICA ORIGINAL) ---
+# --- FUNCIONES DE LECTURA Y ORIENTACIÓN ---
 def orientar_y_leer(imagen_pil, reader):
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
@@ -227,9 +203,6 @@ def procesar_documento(ruta_archivo, reader, temp_dir):
                 if pagina_rgb.size[0] < 500 or pagina_rgb.size[1] < 500: continue
                 
                 img_final, cenco = orientar_y_leer(pagina_rgb, reader)
-                # Escalar para ahorrar peso (Resolución A4 aprox)
-                img_final.thumbnail((1754, 1754), Image.Resampling.LANCZOS)
-                
                 ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
                 img_final.save(ruta_temp, 'JPEG', quality=85)
                 rutas_optimizadas.append(ruta_temp)
@@ -242,8 +215,6 @@ def procesar_documento(ruta_archivo, reader, temp_dir):
             if img.size[0] < 500 or img.size[1] < 500: return [], []
             
             img_final, cenco = orientar_y_leer(img, reader)
-            img_final.thumbnail((1754, 1754), Image.Resampling.LANCZOS)
-            
             ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
             img_final.save(ruta_temp, 'JPEG', quality=85)
             rutas_optimizadas.append(ruta_temp)
@@ -273,7 +244,7 @@ if not st.session_state.procesado:
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Analizando documentos... (Esto puede tomar unos minutos)"):
+            with st.spinner("📦 Analizando documentos..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -292,7 +263,7 @@ if not st.session_state.procesado:
                         for idx, cenco in enumerate(cencos):
                             planillas_reales += 1
                             todas_las_rutas_impresion.append(rutas_est[idx])
-                            resumen.append(f"📄 Documento {planillas_reales} procesado | CENCO: {cenco}")
+                            resumen.append(f"Documento {planillas_reales}: CENCO {cenco}")
                     
                     progress_bar.progress((i + 1) / len(adjuntos))
                     gc.collect()
@@ -301,43 +272,38 @@ if not st.session_state.procesado:
                 st.session_state.resumen = resumen
                 
                 if todas_las_rutas_impresion:
-                    # BLINDAJE: Guardamos el PDF en disco físico, no en RAM.
-                    ruta_pdf_final = os.path.join(temp_dir, "Planillas_SERGEM.pdf")
+                    pdf_buffer = io.BytesIO()
                     with Image.open(todas_las_rutas_impresion[0]) as primera_img:
                         primera_img_rgb = primera_img.convert('RGB')
                         if len(todas_las_rutas_impresion) > 1:
-                            primera_img_rgb.save(ruta_pdf_final, format="PDF", save_all=True, append_images=generador_imagenes(todas_las_rutas_impresion[1:]))
+                            primera_img_rgb.save(pdf_buffer, format="PDF", save_all=True, append_images=generador_imagenes(todas_las_rutas_impresion[1:]))
                         else:
-                            primera_img_rgb.save(ruta_pdf_final, format="PDF")
-                    st.session_state.pdf_path = ruta_pdf_final
+                            primera_img_rgb.save(pdf_buffer, format="PDF")
+                    st.session_state.pdf_bytes = pdf_buffer.getvalue()
                 
                 st.session_state.procesado = True
+                shutil.rmtree(temp_dir, ignore_errors=True)
                 st.rerun()
 
 # --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
     st.success(f"✅ ¡Se procesaron y alinearon {st.session_state.planillas_reales} planillas!")
     
-    st.markdown("### 📋 Resumen de Procesamiento")
-    for linea in st.session_state.resumen:
-        st.markdown(f"<div class='summary-box'>{linea}</div>", unsafe_allow_html=True)
+    with st.expander("Ver detalle de CENCOs detectados"):
+        for linea in st.session_state.resumen:
+            st.text(linea)
     
-    st.write("---")
-    
-    if getattr(st.session_state, 'pdf_path', None) and os.path.exists(st.session_state.pdf_path):
-        with open(st.session_state.pdf_path, "rb") as pdf_file:
-            st.download_button(
-                label="🖨️ Descargar Archivo para Imprimir",
-                data=pdf_file,
-                file_name="Planillas_SERGEM_Listas.pdf",
-                mime="application/pdf",
-                type="primary",
-                use_container_width=True
-            )
+    if st.session_state.pdf_bytes:
+        st.download_button(
+            label="🖨️ Descargar Archivo para Imprimir",
+            data=st.session_state.pdf_bytes,
+            file_name="Planillas_SERGEM_Listas.pdf",
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True
+        )
             
     st.write("---")
     if st.button("♻️ Subir nuevo archivo"):
-        if getattr(st.session_state, 'pdf_path', None):
-            shutil.rmtree(os.path.dirname(st.session_state.pdf_path), ignore_errors=True)
         reiniciar_app()
         st.rerun()
