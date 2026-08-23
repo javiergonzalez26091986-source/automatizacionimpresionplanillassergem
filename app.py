@@ -7,7 +7,7 @@ from email import policy
 import easyocr
 import gc
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
 from pdf2image import convert_from_path
 import tempfile
 import shutil
@@ -21,86 +21,167 @@ Image.MAX_IMAGE_PIXELS = None
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
     st.session_state.pdf_bytes = None
+    st.session_state.excel_bytes = None
     st.session_state.planillas_reales = 0
-    st.session_state.resumen = []
+    st.session_state.df_resultados = pd.DataFrame()
 
 def reiniciar_app():
-    st.session_state.procesado = False
-    st.session_state.pdf_bytes = None
-    st.session_state.planillas_reales = 0
-    st.session_state.resumen = []
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="🖨️")
+st.set_page_config(page_title="Planillas SERGEM", layout="wide", page_icon="sergemLogo.ico")
 
+# --- ESTILOS CSS (Para que se vea bien en cualquier navegador) ---
+st.markdown("""
+    <style>
+    /* Fondo principal y color de texto */
+    .stApp {
+        background-color: #f4f6f9;
+        color: #1e1e1e;
+    }
+    /* Hacer transparente el header de Streamlit */
+    [data-testid="stHeader"] {
+        background-color: rgba(244, 246, 249, 0);
+    }
+    /* Estilo corporativo para los botones primarios */
+    .stButton>button {
+        background-color: #e63946 !important;
+        color: white !important;
+        border-radius: 8px !important;
+        border: none !important;
+        padding: 10px 24px !important;
+        font-weight: bold !important;
+    }
+    .stButton>button:hover {
+        background-color: #d62828 !important;
+    }
+    /* Forzar visibilidad de textos */
+    h1, h2, h3, p, span, label, .stMarkdown {
+        color: #1e1e1e !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- ENCABEZADO CON LOGO ---
 col1, col2 = st.columns([1, 4])
 with col1:
-    st.write("🏢 SERGEM")
+    if os.path.exists("sergemLogo.png"):
+        st.image("sergemLogo.png", width=180)
+    else:
+        st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática estricta y formato 100% apaisado.")
+    st.markdown("Orientación automática, forzado horizontal y extracción espacial de CENCO.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
 def cargar_modelo_ocr():
     return easyocr.Reader(['es'])
 
-# --- FUNCIONES DE LECTURA Y ORIENTACIÓN ---
-def orientar_y_leer(imagen_pil, reader):
-    imagen_pil = ImageOps.exif_transpose(imagen_pil)
+# --- FUNCIONES NÚCLEO ---
+
+def detectar_orientacion_rapida(imagen_pil, reader):
+    """Brújula Turbo: Solo escanea lo necesario para ser veloz"""
+    img_test = imagen_pil.copy()
+    img_test.thumbnail((400, 400), Image.Resampling.LANCZOS)
+    img_test = img_test.convert('L')
     
-    img_brujula = imagen_pil.copy()
-    img_brujula.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
-    img_brujula = img_brujula.convert('L')
-    
+    keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL", "TOTALES"]
     mejor_angulo = 0
     max_score = -1
-    resultados_ganadores = []
     
-    # BRÚJULA DE CONFIANZA MEJORADA
     for angulo in [0, 90, 180, 270]:
-        img_rotada = img_brujula.rotate(angulo, expand=True)
-        res = reader.readtext(np.array(img_rotada))
+        img_rotada = img_test.rotate(angulo, expand=True)
+        # detail=0 hace que easyocr solo devuelva el texto plano, haciéndolo 3x más rápido
+        res = reader.readtext(np.array(img_rotada), detail=0) 
         
-        score = sum(len(texto) for bbox, texto, prob in res if prob > 0.45)
+        texto_completo = " ".join(res).upper()
+        score = sum(1 for kw in keywords if kw in texto_completo)
         
         if score > max_score:
             max_score = score
             mejor_angulo = angulo
-            resultados_ganadores = res
             
-    del img_brujula
-    gc.collect()
-
-    # Rotar la imagen original
-    imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
-
-    # EXTRACCIÓN DE CENCO (Filtro estricto)
-    cenco_final = "No detectado"
-    textos_confiables = [texto.upper() for bbox, texto, prob in resultados_ganadores if prob > 0.3]
-    
-    for i, txt in enumerate(textos_confiables):
-        if "CENC" in txt or "CEN" in txt:
-            match = re.search(r'\d{3,10}|[A-Z]\d{3}', txt)
-            if match:
-                cenco_final = match.group()
-            elif i + 1 < len(textos_confiables):
-                siguiente = re.sub(r'[^A-Z0-9]', '', textos_confiables[i+1])
-                # Filtro Anti-Alucinaciones de fechas
-                if len(siguiente) >= 3 and siguiente not in ['10115', '11631', '0115', '1631', 'OBS', 'MES', 'ANO', 'AÑO']:
-                    cenco_final = siguiente
+        # Si encuentra 3 palabras clave, ya sabemos que está al derecho. Rompemos el ciclo para ahorrar RAM y Tiempo.
+        if score >= 3: 
             break
+            
+    del img_test
+    gc.collect()
+    return mejor_angulo
 
-    # EL TRUCO DEL LIENZO (Forzar Horizontal siempre)
+def extraer_cenco_espacial(resultados):
+    """Busca la palabra CENCO y captura lo que haya a su derecha"""
+    cenco_val = "No detectado"
+    cenco_y_center = None
+    cenco_x_right = None
+    
+    # 1. Buscar la palabra clave
+    for bbox, texto, prob in resultados:
+        txt_upper = texto.upper()
+        if "CENC" in txt_upper:
+            # Si lo leyó todo junto en el mismo cuadro ej: "CENCO: 416"
+            limpio = re.sub(r'[^A-Z0-9]', '', txt_upper.replace('CENCO', '').replace('CENC', ''))
+            if len(limpio) >= 2 and limpio not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL']:
+                return limpio
+            
+            # Guardar coordenadas para buscar al lado
+            cenco_y_center = (bbox[0][1] + bbox[2][1]) / 2
+            cenco_x_right = bbox[1][0]
+            break
+            
+    # 2. Buscar a la derecha usando las coordenadas
+    if cenco_y_center is not None:
+        candidatos = []
+        for bbox, texto, prob in resultados:
+            y_center = (bbox[0][1] + bbox[2][1]) / 2
+            x_left = bbox[0][0]
+            
+            # Si está en el mismo renglón (+/- 40 pixeles) y a la derecha
+            if abs(y_center - cenco_y_center) < 40 and x_left > cenco_x_right - 30:
+                txt_clean = re.sub(r'[^A-Z0-9]', '', texto.upper())
+                if len(txt_clean) >= 2 and txt_clean not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA']:
+                    candidatos.append((x_left, txt_clean))
+        
+        if candidatos:
+            # Ordenar por el que esté más cerquita a la izquierda
+            candidatos.sort(key=lambda x: x[0])
+            cenco_val = candidatos[0][1]
+            
+    return cenco_val
+
+def orientar_y_leer(imagen_pil, reader):
+    imagen_pil = ImageOps.exif_transpose(imagen_pil)
+    
+    # 1. Brújula rápida para ponerla al derecho
+    angulo = detectar_orientacion_rapida(imagen_pil, reader)
+    if angulo != 0:
+        imagen_pil = imagen_pil.rotate(angulo, expand=True)
+
+    # 2. Forzar Horizontal SIEMPRE
     ancho, alto = imagen_pil.size
     if alto > ancho:
-        nuevo_ancho = int(alto * 1.3)
-        canvas = Image.new('RGB', (nuevo_ancho, alto), 'white')
-        offset_x = (nuevo_ancho - ancho) // 2
-        canvas.paste(imagen_pil, (offset_x, 0))
-        imagen_pil = canvas
+        imagen_pil = imagen_pil.rotate(90, expand=True)
 
-    # Recortar marca de agua y estampar
+    # 3. Lectura OCR Final y Extracción Espacial
+    img_ocr = imagen_pil.copy()
+    img_ocr.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
+    img_ocr = img_ocr.convert('L')
+    
+    img_np = np.array(img_ocr)
+    resultados = reader.readtext(img_np)
+    cenco_final = extraer_cenco_espacial(resultados)
+    
+    del img_ocr, img_np
+    gc.collect()
+
+    # 4. Mejorar iluminación SOLO para el PDF (Aclarado)
+    imagen_pil = ImageEnhance.Brightness(imagen_pil).enhance(1.15)
+    imagen_pil = ImageEnhance.Contrast(imagen_pil).enhance(1.2)
+
+    # 5. Recortar marca de agua y estampar
     ancho_final, alto_final = imagen_pil.size
     recorte_inferior = int(alto_final * 0.03)
     imagen_pil = imagen_pil.crop((0, 0, ancho_final, alto_final - recorte_inferior))
@@ -244,7 +325,7 @@ if not st.session_state.procesado:
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Analizando documentos..."):
+            with st.spinner("📦 Analizando documentos a alta velocidad..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -253,7 +334,7 @@ if not st.session_state.procesado:
             else:
                 progress_bar = st.progress(0)
                 todas_las_rutas_impresion = []
-                resumen = []
+                resultados_tabla = []
                 planillas_reales = 0 
                 
                 for i, archivo in enumerate(adjuntos):
@@ -263,14 +344,25 @@ if not st.session_state.procesado:
                         for idx, cenco in enumerate(cencos):
                             planillas_reales += 1
                             todas_las_rutas_impresion.append(rutas_est[idx])
-                            resumen.append(f"Documento {planillas_reales}: CENCO {cenco}")
+                            resultados_tabla.append({
+                                "No.": planillas_reales,
+                                "Documento Original": os.path.basename(archivo),
+                                "CENCO Detectado": cenco
+                            })
                     
                     progress_bar.progress((i + 1) / len(adjuntos))
                     gc.collect()
                 
                 st.session_state.planillas_reales = planillas_reales
-                st.session_state.resumen = resumen
+                st.session_state.df_resultados = pd.DataFrame(resultados_tabla)
                 
+                # Excel
+                if not st.session_state.df_resultados.empty:
+                    excel_buffer = io.BytesIO()
+                    st.session_state.df_resultados.to_excel(excel_buffer, index=False)
+                    st.session_state.excel_bytes = excel_buffer.getvalue()
+                
+                # PDF
                 if todas_las_rutas_impresion:
                     pdf_buffer = io.BytesIO()
                     with Image.open(todas_las_rutas_impresion[0]) as primera_img:
@@ -287,23 +379,33 @@ if not st.session_state.procesado:
 
 # --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
-    st.success(f"✅ ¡Se procesaron y alinearon {st.session_state.planillas_reales} planillas!")
+    st.success(f"✅ ¡Se procesaron, alinearon y aclararon {st.session_state.planillas_reales} planillas!")
     
-    with st.expander("Ver detalle de CENCOs detectados"):
-        for linea in st.session_state.resumen:
-            st.text(linea)
+    # Mostrar tabla directa en lugar de acordeón
+    if not st.session_state.df_resultados.empty:
+        st.dataframe(st.session_state.df_resultados, use_container_width=True, hide_index=True)
     
-    if st.session_state.pdf_bytes:
-        st.download_button(
-            label="🖨️ Descargar Archivo para Imprimir",
-            data=st.session_state.pdf_bytes,
-            file_name="Planillas_SERGEM_Listas.pdf",
-            mime="application/pdf",
-            type="primary",
-            use_container_width=True
-        )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.session_state.excel_bytes:
+            st.download_button(
+                label="📊 Descargar Reporte (Excel)",
+                data=st.session_state.excel_bytes,
+                file_name="Reporte_CENCOS.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+    with col2:
+        if st.session_state.pdf_bytes:
+            st.download_button(
+                label="🖨️ Descargar Planillas Listas para Imprimir",
+                data=st.session_state.pdf_bytes,
+                file_name="Planillas_SERGEM_Listas.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True
+            )
             
     st.write("---")
     if st.button("♻️ Subir nuevo archivo"):
         reiniciar_app()
-        st.rerun()
