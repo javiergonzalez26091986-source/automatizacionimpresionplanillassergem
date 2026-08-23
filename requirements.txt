@@ -1,8 +1,6 @@
 streamlit
-easyocr
-opencv-python-headless
-numpy
-Pillow
+pytesseract
 pdf2image
+Pillow
 pandas
 openpyxl
