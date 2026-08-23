@@ -7,7 +7,7 @@ from email import policy
 import easyocr
 import gc
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pdf2image import convert_from_path
 import tempfile
 import shutil
@@ -45,7 +45,7 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática perfecta, mejora de impresión y extracción directa de CENCO.")
+    st.markdown("Orientación automática perfecta y extracción directa de CENCO.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
@@ -57,79 +57,57 @@ def orientar_y_leer(imagen_pil, reader):
     # 1. Corregir rotación interna de celulares (EXIF)
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 2. Crear miniatura en Blanco y Negro SOLO para el OCR (SIN aclaración previa)
-    # Esto asegura que el IA vea el contraste original de la foto.
+    # 2. Crear miniatura en Blanco y Negro (SIN alteraciones de brillo/contraste)
     img_ocr_base = imagen_pil.copy()
     img_ocr_base.thumbnail((1200, 1200), Image.Resampling.LANCZOS) 
     img_ocr_base = img_ocr_base.convert('L') 
 
-    # 3. Brújula de 4 direcciones: Buscar cuál es "Arriba"
+    # 3. Brújula Universal: Buscar el ángulo con MÁS texto legible (sea cual sea)
     mejor_angulo = 0
-    max_palabras = -1
+    max_palabras_validas = -1
     resultados_finales = []
-    
-    keywords = ["SERGEM", "FORMATO", "REGISTRO", "PRESTACION", "CLIENTE", "FECHA", "FIRMA", "CENCO", "SUCURSAL", "TOTALES", "OBS", "PRODUCTO", "SALIDAS", "HORA", "DIA", "MES", "ABARROTES"]
     
     for angulo in [0, 90, 180, 270]:
         img_rotada = img_ocr_base.rotate(angulo, expand=True)
         img_np = np.array(img_rotada)
         resultados = reader.readtext(img_np)
         
-        texto_completo = " ".join([res[1].upper() for res in resultados])
-        conteo = sum(1 for kw in keywords if kw in texto_completo)
-        
-        if conteo > max_palabras:
-            max_palabras = conteo
+        # Contar cualquier texto que parezca una palabra real (más de 2 caracteres alfanuméricos)
+        palabras_validas = 0
+        for bbox, texto, prob in resultados:
+            texto_limpio = re.sub(r'[^a-zA-Z0-9]', '', texto)
+            if len(texto_limpio) > 2:
+                palabras_validas += 1
+                
+        if palabras_validas > max_palabras_validas:
+            max_palabras_validas = palabras_validas
             mejor_angulo = angulo
             resultados_finales = resultados
-            
-    # SEGURO HORIZONTAL: Si por mala calidad no detectó palabras, garantizamos que quede horizontal
-    if max_palabras <= 0:
-        if imagen_pil.size[1] > imagen_pil.size[0]:
-            mejor_angulo = 90
-            img_rotada = img_ocr_base.rotate(90, expand=True)
-            resultados_finales = reader.readtext(np.array(img_rotada))
 
     del img_ocr_base
     gc.collect()
 
     # 4. Rotar la imagen original de alta calidad al ángulo ganador
     imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
-    
-    # 5. AHORA SÍ: Aplicar "Belleza Facial" SOLO para la impresión final
-    imagen_pil = ImageEnhance.Brightness(imagen_pil).enhance(1.15)
-    imagen_pil = ImageEnhance.Contrast(imagen_pil).enhance(1.15)
 
-    # 6. Extraer el CENCO del texto ya enderezado
+    # 5. Extraer el CENCO (Filtro estricto para evitar alucinaciones)
     cenco_final = "No detectado"
     texto_ganador = " ".join([res[1].upper() for res in resultados_finales])
     
-    match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{2,10})', texto_ganador)
+    # Busca explícitamente "CENCO" seguido de algo que parezca el código
+    match = re.search(r'CENC[O0Q]?\s*[:\-\.]?\s*([A-Z0-9]{3,10})', texto_ganador)
     if match:
-        val = match.group(1).strip()
-        if val not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'ABP', 'ABR', 'ABE', 'FIRMA']:
-            cenco_final = val
-    else:
-        # Búsqueda de rescate más agresiva
-        textos = [res[1].upper() for res in resultados_finales]
-        for i, txt in enumerate(textos):
-            if "CENC" in txt or "CEN" in txt:
-                sub_match = re.search(r'\d{3,}', txt)
-                if sub_match:
-                    cenco_final = sub_match.group()
-                    break
-                elif i + 1 < len(textos):
-                    posible = re.sub(r'[^A-Z0-9]', '', textos[i+1])
-                    if 2 <= len(posible) <= 10 and posible not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA', 'SERGEM', 'DIA']:
-                        cenco_final = posible
-                        break
+        posible_cenco = match.group(1).strip()
+        # Evitar falsos positivos comunes
+        if posible_cenco not in ['OBS', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA']:
+            cenco_final = posible_cenco
 
-    # 7. Recortar marca de agua inferior (ej. CamScanner)
+    # 6. Recortar marca de agua inferior (ej. CamScanner)
     ancho, alto = imagen_pil.size
     recorte_inferior = int(alto * 0.03)
     imagen_pil = imagen_pil.crop((0, 0, ancho, alto - recorte_inferior))
 
-    # 8. Estampar CENCO visible
+    # 7. Estampar CENCO visible
     dibujo = ImageDraw.Draw(imagen_pil)
     try:
         tamano_fuente = int(imagen_pil.size[1] * 0.03) 
@@ -151,8 +129,9 @@ def orientar_y_leer(imagen_pil, reader):
     dibujo.rectangle((x, y, x + ancho_texto, y + alto_texto + 10), fill="white", outline="black", width=2)
     dibujo.text((x, y + 5), texto_sello, fill="red", font=fuente)
     
-    # 9. ÚLTIMA VALIDACIÓN HORIZONTAL (Landscape Forzado)
-    if imagen_pil.size[1] > imagen_pil.size[0]:
+    # 8. GARANTÍA GEOMÉTRICA (Forzar Horizontal siempre)
+    ancho_final, alto_final = imagen_pil.size
+    if alto_final > ancho_final:
         imagen_pil = imagen_pil.rotate(90, expand=True)
     
     return imagen_pil, cenco_final
@@ -273,7 +252,7 @@ if not st.session_state.procesado:
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Extrayendo archivos y aplicando brújula inteligente OCR..."):
+            with st.spinner("📦 Extrayendo archivos y orientando planillas..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -334,7 +313,7 @@ if not st.session_state.procesado:
 
 # --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
-    st.success(f"✅ ¡Procesamiento masivo finalizado! Se orientaron al derecho y se generaron {st.session_state.planillas_reales} planillas horizontales con éxito.")
+    st.success(f"✅ ¡Procesamiento finalizado! Se estructuraron {st.session_state.planillas_reales} planillas horizontales.")
     
     st.dataframe(st.session_state.df_resultados, use_container_width=True)
     
@@ -352,12 +331,12 @@ if st.session_state.procesado:
             st.download_button(
                 label="🖨️ Descargar Planillas Listas para Imprimir",
                 data=st.session_state.pdf_bytes,
-                file_name="Planillas_SERGEM_Alineadas_Horizontales.pdf",
+                file_name="Planillas_SERGEM_Horizontales.pdf",
                 mime="application/pdf",
                 type="primary"
             )
             
     st.write("---")
-    if st.button("♻️ Finalizar y Procesar Nueva Quincena"):
+    if st.button("♻️ Procesar Nuevo Archivo"):
         reiniciar_app()
         st.rerun()
