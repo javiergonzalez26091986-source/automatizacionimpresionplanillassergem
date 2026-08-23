@@ -11,7 +11,6 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pdf2image import convert_from_path
 import tempfile
 import shutil
-import pandas as pd
 import re
 import io
 
@@ -22,29 +21,24 @@ Image.MAX_IMAGE_PIXELS = None
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
     st.session_state.pdf_bytes = None
-    st.session_state.excel_bytes = None
-    st.session_state.df_resultados = pd.DataFrame()
     st.session_state.planillas_reales = 0
+    st.session_state.resumen = []
 
 def reiniciar_app():
     st.session_state.procesado = False
     st.session_state.pdf_bytes = None
-    st.session_state.excel_bytes = None
-    st.session_state.df_resultados = pd.DataFrame()
     st.session_state.planillas_reales = 0
+    st.session_state.resumen = []
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="🖨️")
 
 col1, col2 = st.columns([1, 4])
 with col1:
-    if os.path.exists("sergemLogo.png"):
-        st.image("sergemLogo.png", width=180)
-    else:
-        st.write("🏢 SERGEM")
+    st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Brújula de confianza OCR, Lienzo Horizontal y Filtro Anti-Alucinaciones.")
+    st.markdown("Orientación automática estricta y formato 100% apaisado.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
@@ -53,10 +47,8 @@ def cargar_modelo_ocr():
 
 # --- FUNCIONES DE LECTURA Y ORIENTACIÓN ---
 def orientar_y_leer(imagen_pil, reader):
-    # 1. Corregir rotación interna de celulares (EXIF)
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # 2. BRÚJULA DE CONFIANZA
     img_brujula = imagen_pil.copy()
     img_brujula.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
     img_brujula = img_brujula.convert('L')
@@ -65,12 +57,11 @@ def orientar_y_leer(imagen_pil, reader):
     max_score = -1
     resultados_ganadores = []
     
+    # BRÚJULA DE CONFIANZA MEJORADA
     for angulo in [0, 90, 180, 270]:
         img_rotada = img_brujula.rotate(angulo, expand=True)
         res = reader.readtext(np.array(img_rotada))
         
-        # EL SECRETO: Solo sumar letras si la IA está más de un 45% segura (prob > 0.45)
-        # Esto elimina firmas, rayones y ruido que leen al revés.
         score = sum(len(texto) for bbox, texto, prob in res if prob > 0.45)
         
         if score > max_score:
@@ -81,42 +72,35 @@ def orientar_y_leer(imagen_pil, reader):
     del img_brujula
     gc.collect()
 
-    # 3. Rotar la imagen original al ángulo ganador real
+    # Rotar la imagen original
     imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
 
-    # 4. EXTRACCIÓN DE CENCO (Filtro Anti-Alucinaciones)
+    # EXTRACCIÓN DE CENCO (Filtro estricto)
     cenco_final = "No detectado"
-    # Solo usamos palabras con buena confianza
     textos_confiables = [texto.upper() for bbox, texto, prob in resultados_ganadores if prob > 0.3]
-    texto_ganador = " ".join(textos_confiables)
     
-    # Buscar explícitamente la palabra CENCO o CENC
     for i, txt in enumerate(textos_confiables):
         if "CENC" in txt or "CEN" in txt:
-            # Buscar número pegado a la palabra
             match = re.search(r'\d{3,10}|[A-Z]\d{3}', txt)
             if match:
                 cenco_final = match.group()
-            # Buscar en la siguiente palabra leída
             elif i + 1 < len(textos_confiables):
                 siguiente = re.sub(r'[^A-Z0-9]', '', textos_confiables[i+1])
-                # Bloquear falsos positivos (Quincenas y basuras)
+                # Filtro Anti-Alucinaciones de fechas
                 if len(siguiente) >= 3 and siguiente not in ['10115', '11631', '0115', '1631', 'OBS', 'MES', 'ANO', 'AÑO']:
                     cenco_final = siguiente
             break
 
-    # 5. EL TRUCO DEL LIENZO (Forzar Horizontal sin acostar el texto)
+    # EL TRUCO DEL LIENZO (Forzar Horizontal siempre)
     ancho, alto = imagen_pil.size
     if alto > ancho:
-        # En lugar de rotarla y dejar el texto de lado, creamos un fondo blanco horizontal
-        nuevo_ancho = int(alto * 1.3) # Proporción para que quede apaisada
+        nuevo_ancho = int(alto * 1.3)
         canvas = Image.new('RGB', (nuevo_ancho, alto), 'white')
-        # Pegamos la planilla vertical en todo el centro
         offset_x = (nuevo_ancho - ancho) // 2
         canvas.paste(imagen_pil, (offset_x, 0))
         imagen_pil = canvas
 
-    # 6. Recortar marca de agua inferior y estampar
+    # Recortar marca de agua y estampar
     ancho_final, alto_final = imagen_pil.size
     recorte_inferior = int(alto_final * 0.03)
     imagen_pil = imagen_pil.crop((0, 0, ancho_final, alto_final - recorte_inferior))
@@ -144,10 +128,10 @@ def orientar_y_leer(imagen_pil, reader):
     
     return imagen_pil, cenco_final
 
-# --- EXTRACCIÓN MASIVA DE CORREOS Y ZIPs ---
+# --- EXTRACCIÓN MASIVA ---
 def extraer_adjuntos(contenido_bytes, directorio_salida, es_zip=False):
     adjuntos = []
-    extensiones_validas = ('.pdf', '.jpeg', '.jpg', '.png', '.bmp', '.webp', '.tiff')
+    extensiones_validas = ('.pdf', '.jpeg', '.jpg', '.png')
     
     if es_zip:
         try:
@@ -210,7 +194,7 @@ def procesar_archivo_comprimido(archivo_subido, directorio_salida):
 
 def procesar_documento(ruta_archivo, reader, temp_dir):
     rutas_optimizadas = []
-    resultados = []
+    cencos_extraidos = []
     try:
         if ruta_archivo.lower().endswith('.pdf'):
             paginas = convert_from_path(ruta_archivo, dpi=130)
@@ -222,7 +206,7 @@ def procesar_documento(ruta_archivo, reader, temp_dir):
                 ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
                 img_final.save(ruta_temp, 'JPEG', quality=85)
                 rutas_optimizadas.append(ruta_temp)
-                resultados.append(cenco)
+                cencos_extraidos.append(cenco)
                 
                 del pagina_rgb, img_final
                 gc.collect()
@@ -234,12 +218,12 @@ def procesar_documento(ruta_archivo, reader, temp_dir):
             ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
             img_final.save(ruta_temp, 'JPEG', quality=85)
             rutas_optimizadas.append(ruta_temp)
-            resultados.append(cenco)
+            cencos_extraidos.append(cenco)
             
             del img, img_final
             gc.collect()
             
-        return rutas_optimizadas, resultados
+        return rutas_optimizadas, cencos_extraidos
     except Exception:
         return [], []
 
@@ -255,12 +239,12 @@ if not st.session_state.procesado:
     archivo_zimbra = st.file_uploader("📂 Arrastra aquí el exporte masivo de Zimbra (.tgz o .zip)", type=['tgz', 'zip', 'tar.gz'])
 
     if archivo_zimbra is not None:
-        if st.button("🚀 Procesar Quincena", type="primary"):
+        if st.button("🚀 Procesar Planillas", type="primary"):
             
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Extrayendo archivos y orientando planillas con Inteligencia Artificial..."):
+            with st.spinner("📦 Analizando documentos..."):
                 adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
             if not adjuntos:
@@ -268,39 +252,24 @@ if not st.session_state.procesado:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             else:
                 progress_bar = st.progress(0)
-                status_text = st.empty()
-                resultados_tabla = []
                 todas_las_rutas_impresion = []
+                resumen = []
                 planillas_reales = 0 
                 
                 for i, archivo in enumerate(adjuntos):
-                    nombre_archivo = os.path.basename(archivo)
-                    status_text.text(f"Orientando y leyendo: {nombre_archivo}")
+                    rutas_est, cencos = procesar_documento(archivo, reader, temp_dir)
                     
-                    rutas_est, datos_extraidos = procesar_documento(archivo, reader, temp_dir)
-                    
-                    if not rutas_est:
-                        progress_bar.progress((i + 1) / len(adjuntos))
-                        continue
-                    
-                    for idx, cenco in enumerate(datos_extraidos):
-                        planillas_reales += 1
-                        todas_las_rutas_impresion.append(rutas_est[idx])
-                        
-                        resultados_tabla.append({
-                            "Documento": nombre_archivo,
-                            "CENCO Extraído": cenco
-                        })
+                    if rutas_est:
+                        for idx, cenco in enumerate(cencos):
+                            planillas_reales += 1
+                            todas_las_rutas_impresion.append(rutas_est[idx])
+                            resumen.append(f"Documento {planillas_reales}: CENCO {cenco}")
                     
                     progress_bar.progress((i + 1) / len(adjuntos))
                     gc.collect()
                 
-                st.session_state.df_resultados = pd.DataFrame(resultados_tabla)
                 st.session_state.planillas_reales = planillas_reales
-                
-                excel_buffer = io.BytesIO()
-                st.session_state.df_resultados.to_excel(excel_buffer, index=False)
-                st.session_state.excel_bytes = excel_buffer.getvalue()
+                st.session_state.resumen = resumen
                 
                 if todas_las_rutas_impresion:
                     pdf_buffer = io.BytesIO()
@@ -318,30 +287,23 @@ if not st.session_state.procesado:
 
 # --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
-    st.success(f"✅ ¡Procesamiento finalizado! Se estructuraron {st.session_state.planillas_reales} planillas horizontales.")
+    st.success(f"✅ ¡Se procesaron y alinearon {st.session_state.planillas_reales} planillas!")
     
-    st.dataframe(st.session_state.df_resultados, use_container_width=True)
+    with st.expander("Ver detalle de CENCOs detectados"):
+        for linea in st.session_state.resumen:
+            st.text(linea)
     
-    col1, col2 = st.columns(2)
-    with col1:
+    if st.session_state.pdf_bytes:
         st.download_button(
-            label="📊 Descargar Reporte (Excel)",
-            data=st.session_state.excel_bytes,
-            file_name="Reporte_Quincenal_SERGEM.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"
+            label="🖨️ Descargar Archivo para Imprimir",
+            data=st.session_state.pdf_bytes,
+            file_name="Planillas_SERGEM_Listas.pdf",
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True
         )
-    with col2:
-        if st.session_state.pdf_bytes:
-            st.download_button(
-                label="🖨️ Descargar Planillas Listas para Imprimir",
-                data=st.session_state.pdf_bytes,
-                file_name="Planillas_SERGEM_Horizontales.pdf",
-                mime="application/pdf",
-                type="primary"
-            )
             
     st.write("---")
-    if st.button("♻️ Procesar Nuevo Archivo"):
+    if st.button("♻️ Subir nuevo archivo"):
         reiniciar_app()
         st.rerun()
