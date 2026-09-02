@@ -7,80 +7,100 @@ from email import policy
 import easyocr
 import gc
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
-from pdf2image import convert_from_path
+from PIL import Image, ImageOps
+import fitz  # PyMuPDF
 import tempfile
 import shutil
-import re
 import io
 import pandas as pd
+import hashlib
+import json
 
 # --- PROTECCIÓN PARA IMÁGENES MASIVAS Y MEMORIA ---
 Image.MAX_IMAGE_PIXELS = None 
+
+# --- MEMORIA HISTÓRICA (FILTRO DE DUPLICADOS) ---
+ARCHIVO_HISTORIAL = "registro_sergem.json"
+
+def cargar_historial():
+    if os.path.exists(ARCHIVO_HISTORIAL):
+        try:
+            with open(ARCHIVO_HISTORIAL, 'r') as f:
+                return set(json.load(f))
+        except:
+            return set()
+    return set()
+
+def guardar_historial(historial_set):
+    with open(ARCHIVO_HISTORIAL, 'w') as f:
+        json.dump(list(historial_set), f)
+
+def obtener_hash(ruta_archivo):
+    hasher = hashlib.md5()
+    with open(ruta_archivo, 'rb') as f:
+        buf = f.read()
+        hasher.update(buf)
+    return hasher.hexdigest()
 
 # --- INICIALIZAR MEMORIA DE STREAMLIT ---
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
     st.session_state.pdf_bytes = None
-    st.session_state.excel_bytes = None
     st.session_state.planillas_reales = 0
+    st.session_state.planillas_omitidas = 0
     st.session_state.df_resultados = pd.DataFrame()
 
 def reiniciar_app():
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
+    st.session_state.procesado = False
+    st.session_state.pdf_bytes = None
+    st.session_state.planillas_reales = 0
+    st.session_state.planillas_omitidas = 0
+    st.session_state.df_resultados = pd.DataFrame()
     st.rerun()
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(page_title="Planillas SERGEM", layout="wide", page_icon="sergemLogo.ico")
+st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="sergemLogo.ico")
 
-# --- ESTILOS CSS (Para que se vea bien en cualquier navegador) ---
+# --- ESTILOS CSS A PRUEBA DE MODO OSCURO ---
 st.markdown("""
     <style>
-    /* Fondo principal universal (Tema Claro) */
-    .stApp {
-        background-color: #f4f6f9 !important;
-    }
-    /* Hacer transparente el header de Streamlit */
-    [data-testid="stHeader"] {
-        background-color: rgba(244, 246, 249, 0) !important;
-    }
-    /* Forzar color de texto a oscuro para legibilidad */
-    h1, h2, h3, p, span, label, .stMarkdown {
-        color: #1e1e1e !important;
-    }
-    /* ARREGLO DEL BOTÓN DE CARGA DE ARCHIVOS */
+    /* Forzar fondo claro en la app principal y en la barra lateral */
+    .stApp, [data-testid="stSidebar"] { background-color: #f4f6f9 !important; }
+    
+    /* Forzar texto oscuro para títulos, etiquetas y textos en la barra lateral */
+    h1, h2, h3, p, span, label, .stMarkdown, [data-testid="stSidebar"] p { color: #1e1e1e !important; }
+    [data-testid="stHeader"] { background-color: rgba(0,0,0,0) !important; }
+    
+    /* Iluminar la caja donde se arrastran los archivos */
     [data-testid="stFileUploadDropzone"] {
         background-color: #ffffff !important;
-        border: 2px dashed #a0a0a5 !important;
-        color: #1e1e1e !important;
+        border: 2px dashed #e63946 !important;
     }
-    [data-testid="stFileUploadDropzone"] * {
-        color: #1e1e1e !important;
+    [data-testid="stFileUploadDropzone"] * { 
+        color: #1e1e1e !important; 
+        fill: #e63946 !important; /* Colorea el ícono de la nube */
     }
-    /* Estilo corporativo para los botones primarios */
-    .stButton>button {
+    
+    /* Estilo agresivo para garantizar botones rojos brillantes con texto blanco */
+    div[data-testid="stButton"] > button {
         background-color: #e63946 !important;
         color: #ffffff !important;
         border-radius: 8px !important;
-        border: none !important;
-        padding: 10px 24px !important;
+        border: 1px solid #d62828 !important;
         font-weight: bold !important;
+        opacity: 1 !important;
     }
-    .stButton>button:hover {
-        background-color: #d62828 !important;
+    div[data-testid="stButton"] > button:hover { 
+        background-color: #d62828 !important; 
+        border: 1px solid #1e1e1e !important; 
     }
-    .stButton>button * {
-        color: #ffffff !important;
-    }
-    /* Arreglo para la tabla de datos */
-    [data-testid="stDataFrame"] {
-        background-color: #ffffff !important;
-    }
+    div[data-testid="stButton"] > button * { color: #ffffff !important; }
+    
+    /* Fondo claro para la tabla de resultados */
+    [data-testid="stDataFrame"] { background-color: #ffffff !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- ENCABEZADO CON LOGO ---
 col1, col2 = st.columns([1, 4])
 with col1:
     if os.path.exists("sergemLogo.png"):
@@ -89,97 +109,42 @@ with col1:
         st.write("🏢 SERGEM")
 with col2:
     st.title("Automatización de Planillas SERGEM")
-    st.markdown("Orientación automática estricta, formato 100% apaisado y extracción de CENCO optimizada.")
+    st.markdown("Orientación automática horizontal 100%.")
 
 # --- CARGA DEL MODELO OCR ---
 @st.cache_resource
 def cargar_modelo_ocr():
-    return easyocr.Reader(['es'])
+    return easyocr.Reader(['es'], gpu=False)
 
-# --- FUNCIONES DE LECTURA Y ORIENTACIÓN ---
-def extraer_cenco_espacial(resultados):
-    """Busca la palabra CENCO y captura el valor que está a su derecha"""
-    cenco_val = "No detectado"
-    cenco_y_center = None
-    cenco_x_right = None
-    
-    # 1. Encontrar la coordenada de la palabra "CENCO"
-    for bbox, texto, prob in resultados:
-        txt_upper = str(texto).upper().strip()
-        if "CENC" in txt_upper:
-            # Si lo leyó todo en el mismo cuadro (ej: "CENCO: 416")
-            limpio = re.sub(r'[^A-Z0-9]', '', txt_upper.replace('CENCO', '').replace('CENC', ''))
-            if len(limpio) >= 2 and limpio not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'DESDES', 'CORTE']:
-                return limpio
-            
-            # Guardamos las coordenadas para buscar a la derecha
-            cenco_y_center = (bbox[0][1] + bbox[2][1]) / 2
-            cenco_x_right = bbox[1][0]
-            break
-            
-    # 2. Buscar números a la derecha en el mismo renglón
-    if cenco_y_center is not None:
-        candidatos = []
-        for bbox, texto, prob in resultados:
-            txt_upper = str(texto).upper().strip()
-            if "CENC" in txt_upper: 
-                continue
-            
-            y_center = (bbox[0][1] + bbox[2][1]) / 2
-            x_left = bbox[0][0]
-            
-            # Margen de error vertical (+/- 50 pixeles) y que esté a la derecha
-            if abs(y_center - cenco_y_center) < 50 and x_left > cenco_x_right - 20:
-                txt_clean = re.sub(r'[^A-Z0-9]', '', txt_upper)
-                # Filtramos basura común para asegurar que sea un CENCO
-                if len(txt_clean) >= 2 and txt_clean not in ['OBS', 'PP', 'MES', 'ANO', 'AÑO', 'SUCURSAL', 'FIRMA']:
-                    candidatos.append((x_left, txt_clean))
-        
-        if candidatos:
-            # Ordenamos por cercanía a la palabra CENCO
-            candidatos.sort(key=lambda x: x[0])
-            cenco_val = candidatos[0][1]
-            
-    return cenco_val
-
-def orientar_y_leer(imagen_pil, reader):
+# --- FUNCIONES DE LECTURA Y ORIENTACIÓN (LÓGICA ORIGINAL INTACTA) ---
+def orientar_y_estandarizar(imagen_pil, reader):
     imagen_pil = ImageOps.exif_transpose(imagen_pil)
     
-    # BRÚJULA PARA ENCONTRAR EL LADO CORRECTO
+    # 1. BRÚJULA ORIGINAL INTACTA
     img_brujula = imagen_pil.copy()
-    img_brujula.thumbnail((800, 800), Image.Resampling.LANCZOS) # Más pequeño para ahorrar memoria
+    img_brujula.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
     img_brujula = img_brujula.convert('L')
     
     mejor_angulo = 0
     max_score = -1
-    resultados_ganadores = []
     
     for angulo in [0, 90, 180, 270]:
         img_rotada = img_brujula.rotate(angulo, expand=True)
-        img_np = np.array(img_rotada)
-        res = reader.readtext(img_np)
+        res = reader.readtext(np.array(img_rotada))
         
-        # Calificación basada en confianza del texto
         score = sum(len(texto) for bbox, texto, prob in res if prob > 0.45)
         
         if score > max_score:
             max_score = score
             mejor_angulo = angulo
-            resultados_ganadores = res
-            
-        del img_np, img_rotada # Limpieza de memoria agresiva en cada ciclo
-        gc.collect()
             
     del img_brujula
     gc.collect()
 
-    # Rotar la imagen original de alta calidad
+    # Rotar la imagen original
     imagen_pil = imagen_pil.rotate(mejor_angulo, expand=True)
 
-    # EXTRACCIÓN ESPACIAL DEL CENCO
-    cenco_final = extraer_cenco_espacial(resultados_ganadores)
-
-    # EL TRUCO DEL LIENZO (Para forzar Horizontal sin distorsionar, rellenando con blanco)
+    # 2. TRUCO DEL LIENZO INTACTO (Forzar Horizontal)
     ancho, alto = imagen_pil.size
     if alto > ancho:
         nuevo_ancho = int(alto * 1.3)
@@ -188,33 +153,23 @@ def orientar_y_leer(imagen_pil, reader):
         canvas.paste(imagen_pil, (offset_x, 0))
         imagen_pil = canvas
 
-    # Recortar marca de agua y estampar
-    ancho_final, alto_final = imagen_pil.size
-    recorte_inferior = int(alto_final * 0.03)
-    imagen_pil = imagen_pil.crop((0, 0, ancho_final, alto_final - recorte_inferior))
-
-    dibujo = ImageDraw.Draw(imagen_pil)
-    try:
-        tamano_fuente = int(imagen_pil.size[1] * 0.03) 
-        fuente = ImageFont.truetype("arial.ttf", tamano_fuente)
-    except IOError:
-        fuente = ImageFont.load_default()
-        
-    texto_sello = f" CENCO: {cenco_final} " if cenco_final != "No detectado" else " CENCO: No detectado "
+    # 3. ESTANDARIZACIÓN PARA IMPRESIÓN PDF PERFECTA (TAMAÑO CARTA APAISADO)
+    ancho_objetivo = 2200
+    alto_objetivo = 1700
     
-    try:
-        caja_texto = dibujo.textbbox((0, 0), texto_sello, font=fuente)
-        ancho_texto = caja_texto[2] - caja_texto[0]
-        alto_texto = caja_texto[3] - caja_texto[1]
-    except AttributeError:
-        ancho_texto, alto_texto = dibujo.textsize(texto_sello, font=fuente)
-
-    x = imagen_pil.size[0] - ancho_texto - 20
-    y = 20
-    dibujo.rectangle((x, y, x + ancho_texto, y + alto_texto + 10), fill="white", outline="black", width=2)
-    dibujo.text((x, y + 5), texto_sello, fill="red", font=fuente)
+    ratio = min(ancho_objetivo / imagen_pil.width, alto_objetivo / imagen_pil.height)
+    nuevo_ancho = int(imagen_pil.width * ratio)
+    nuevo_alto = int(imagen_pil.height * ratio)
     
-    return imagen_pil, cenco_final
+    img_redimensionada = imagen_pil.resize((nuevo_ancho, nuevo_alto), Image.Resampling.LANCZOS)
+    
+    lienzo_final = Image.new('RGB', (ancho_objetivo, alto_objetivo), 'white')
+    
+    pos_x = (ancho_objetivo - nuevo_ancho) // 2
+    pos_y = (alto_objetivo - nuevo_alto) // 2
+    lienzo_final.paste(img_redimensionada, (pos_x, pos_y))
+    
+    return lienzo_final
 
 # --- EXTRACCIÓN MASIVA ---
 def extraer_adjuntos(contenido_bytes, directorio_salida, es_zip=False):
@@ -282,38 +237,41 @@ def procesar_archivo_comprimido(archivo_subido, directorio_salida):
 
 def procesar_documento(ruta_archivo, reader, temp_dir):
     rutas_optimizadas = []
-    cencos_extraidos = []
     try:
         if ruta_archivo.lower().endswith('.pdf'):
-            paginas = convert_from_path(ruta_archivo, dpi=130)
-            for i, pagina in enumerate(paginas):
-                pagina_rgb = pagina.convert('RGB')
-                if pagina_rgb.size[0] < 500 or pagina_rgb.size[1] < 500: continue
+            doc = fitz.open(ruta_archivo)
+            for i in range(len(doc)):
+                pagina = doc.load_page(i)
+                pix = pagina.get_pixmap(dpi=130)
+                if pix.alpha:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                imagen_rgb = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 
-                img_final, cenco = orientar_y_leer(pagina_rgb, reader)
+                if imagen_rgb.size[0] < 500 or imagen_rgb.size[1] < 500: continue
+                
+                img_final = orientar_y_estandarizar(imagen_rgb, reader)
                 ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
                 img_final.save(ruta_temp, 'JPEG', quality=85)
                 rutas_optimizadas.append(ruta_temp)
-                cencos_extraidos.append(cenco)
                 
-                del pagina_rgb, img_final
+                del imagen_rgb, img_final, pix
                 gc.collect()
+            doc.close()
         else:
             img = Image.open(ruta_archivo).convert('RGB')
-            if img.size[0] < 500 or img.size[1] < 500: return [], []
+            if img.size[0] < 500 or img.size[1] < 500: return []
             
-            img_final, cenco = orientar_y_leer(img, reader)
+            img_final = orientar_y_estandarizar(img, reader)
             ruta_temp = os.path.join(temp_dir, f"proc_{os.urandom(4).hex()}.jpg")
             img_final.save(ruta_temp, 'JPEG', quality=85)
             rutas_optimizadas.append(ruta_temp)
-            cencos_extraidos.append(cenco)
             
             del img, img_final
             gc.collect()
             
-        return rutas_optimizadas, cencos_extraidos
+        return rutas_optimizadas
     except Exception:
-        return [], []
+        return []
 
 def generador_imagenes(rutas):
     for ruta in rutas:
@@ -324,6 +282,14 @@ def generador_imagenes(rutas):
 # --- FLUJO PRINCIPAL ---
 
 if not st.session_state.procesado:
+    
+    with st.sidebar:
+        st.write("⚙️ **Configuración**")
+        if st.button("🗑️ Borrar memoria de planillas", help="Usa esto para reiniciar la memoria al empezar una nueva quincena."):
+            if os.path.exists(ARCHIVO_HISTORIAL):
+                os.remove(ARCHIVO_HISTORIAL)
+            st.success("¡Memoria borrada con éxito!")
+
     archivo_zimbra = st.file_uploader("📂 Arrastra aquí el exporte masivo de Zimbra (.tgz o .zip)", type=['tgz', 'zip', 'tar.gz'])
 
     if archivo_zimbra is not None:
@@ -332,82 +298,88 @@ if not st.session_state.procesado:
             reader = cargar_modelo_ocr()
             temp_dir = tempfile.mkdtemp()
             
-            with st.spinner("📦 Analizando documentos optimizando la memoria RAM..."):
-                adjuntos = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
+            with st.spinner("📦 Enderezando y estandarizando en tamaño Carta (Letter)..."):
+                adjuntos_totales = procesar_archivo_comprimido(archivo_zimbra, temp_dir)
                 
-            if not adjuntos:
+            if not adjuntos_totales:
                 st.warning("No se encontraron planillas válidas.")
                 shutil.rmtree(temp_dir, ignore_errors=True)
             else:
-                progress_bar = st.progress(0)
-                todas_las_rutas_impresion = []
-                resultados_tabla = []
-                planillas_reales = 0 
+                historial_actual = cargar_historial()
+                adjuntos_nuevos = []
+                nuevos_hashes = []
                 
-                for i, archivo in enumerate(adjuntos):
-                    rutas_est, cencos = procesar_documento(archivo, reader, temp_dir)
+                for archivo in adjuntos_totales:
+                    hash_doc = obtener_hash(archivo)
+                    if hash_doc not in historial_actual:
+                        adjuntos_nuevos.append(archivo)
+                        nuevos_hashes.append(hash_doc)
+                
+                omitidas = len(adjuntos_totales) - len(adjuntos_nuevos)
+                st.session_state.planillas_omitidas = omitidas
+
+                if not adjuntos_nuevos:
+                    st.info(f"Las {len(adjuntos_totales)} planillas de este paquete ya fueron procesadas anteriormente. No hay archivos nuevos para imprimir.")
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                else:
+                    progress_bar = st.progress(0)
+                    todas_las_rutas_impresion = []
+                    resultados_tabla = []
+                    planillas_reales = 0 
                     
-                    if rutas_est:
-                        for idx, cenco in enumerate(cencos):
-                            planillas_reales += 1
-                            todas_las_rutas_impresion.append(rutas_est[idx])
-                            resultados_tabla.append({
-                                "No.": planillas_reales,
-                                "Documento Original": os.path.basename(archivo),
-                                "CENCO Detectado": cenco
-                            })
+                    for i, archivo in enumerate(adjuntos_nuevos):
+                        rutas_est = procesar_documento(archivo, reader, temp_dir)
+                        
+                        if rutas_est:
+                            for idx, ruta in enumerate(rutas_est):
+                                planillas_reales += 1
+                                todas_las_rutas_impresion.append(ruta)
+                                resultados_tabla.append({
+                                    "No.": planillas_reales,
+                                    "Documento Original": os.path.basename(archivo),
+                                    "Estado": "Orientada y Estandarizada (Carta)"
+                                })
+                        
+                        progress_bar.progress((i + 1) / len(adjuntos_nuevos))
+                        gc.collect()
                     
-                    progress_bar.progress((i + 1) / len(adjuntos))
-                    gc.collect()
-                
-                st.session_state.planillas_reales = planillas_reales
-                st.session_state.df_resultados = pd.DataFrame(resultados_tabla)
-                
-                # Excel
-                if not st.session_state.df_resultados.empty:
-                    excel_buffer = io.BytesIO()
-                    st.session_state.df_resultados.to_excel(excel_buffer, index=False)
-                    st.session_state.excel_bytes = excel_buffer.getvalue()
-                
-                # PDF
-                if todas_las_rutas_impresion:
-                    pdf_buffer = io.BytesIO()
-                    with Image.open(todas_las_rutas_impresion[0]) as primera_img:
-                        primera_img_rgb = primera_img.convert('RGB')
-                        if len(todas_las_rutas_impresion) > 1:
-                            primera_img_rgb.save(pdf_buffer, format="PDF", save_all=True, append_images=generador_imagenes(todas_las_rutas_impresion[1:]))
-                        else:
-                            primera_img_rgb.save(pdf_buffer, format="PDF")
-                    st.session_state.pdf_bytes = pdf_buffer.getvalue()
-                
-                st.session_state.procesado = True
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                st.rerun()
+                    for h in nuevos_hashes:
+                        historial_actual.add(h)
+                    guardar_historial(historial_actual)
+                    
+                    st.session_state.planillas_reales = planillas_reales
+                    st.session_state.df_resultados = pd.DataFrame(resultados_tabla)
+
+                    if todas_las_rutas_impresion:
+                        pdf_buffer = io.BytesIO()
+                        with Image.open(todas_las_rutas_impresion[0]) as primera_img:
+                            primera_img_rgb = primera_img.convert('RGB')
+                            if len(todas_las_rutas_impresion) > 1:
+                                primera_img_rgb.save(pdf_buffer, format="PDF", save_all=True, append_images=generador_imagenes(todas_las_rutas_impresion[1:]))
+                            else:
+                                primera_img_rgb.save(pdf_buffer, format="PDF")
+                        st.session_state.pdf_bytes = pdf_buffer.getvalue()
+                    
+                    st.session_state.procesado = True
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    st.rerun()
 
 # --- VISTA DE RESULTADOS ---
 if st.session_state.procesado:
-    st.success(f"✅ ¡Se procesaron y alinearon {st.session_state.planillas_reales} planillas con éxito!")
+    st.success(f"✅ ¡Se procesaron y estandarizaron {st.session_state.planillas_reales} planillas con éxito!")
+    if st.session_state.planillas_omitidas > 0:
+        st.info(f"⏭️ Se omitieron **{st.session_state.planillas_omitidas}** planillas ya procesadas en sesiones anteriores.")
     
-    # Mostrar tabla directa, sin índices visuales para más limpieza
     if not st.session_state.df_resultados.empty:
         st.dataframe(st.session_state.df_resultados, use_container_width=True, hide_index=True)
     
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.session_state.excel_bytes:
-            st.download_button(
-                label="📊 Descargar Reporte (Excel)",
-                data=st.session_state.excel_bytes,
-                file_name="Reporte_CENCOS.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+    col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         if st.session_state.pdf_bytes:
             st.download_button(
-                label="🖨️ Descargar Planillas Listas para Imprimir",
+                label="🖨️ Descargar Archivo para Imprimir (Tamaño Carta)",
                 data=st.session_state.pdf_bytes,
-                file_name="Planillas_SERGEM_Listas.pdf",
+                file_name="Planillas_SERGEM_listasparaimprimir.pdf",
                 mime="application/pdf",
                 type="primary",
                 use_container_width=True
