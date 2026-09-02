@@ -61,9 +61,15 @@ def reiniciar_app():
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Gestor de Planillas SERGEM", layout="wide", page_icon="sergemLogo.ico")
 
-# --- ESTILOS CSS A PRUEBA DE MODO OSCURO ---
+# --- ESTILOS CSS A PRUEBA DE MODO OSCURO Y SIN BOTONES DE STREAMLIT ---
 st.markdown("""
     <style>
+    /* Ocultar botones de GitHub, Share, menú superior y pie de página de Streamlit */
+    header {visibility: hidden !important;}
+    [data-testid="stToolbar"] {visibility: hidden !important;}
+    #MainMenu {visibility: hidden !important;}
+    footer {visibility: hidden !important;}
+
     /* Forzar fondo claro en la app principal y en la barra lateral */
     .stApp, [data-testid="stSidebar"] { background-color: #f4f6f9 !important; }
     
