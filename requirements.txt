@@ -1,8 +1,6 @@
 streamlit
 easyocr
-pdf2image
-Pillow
-pandas
-openpyxl
-opencv-python-headless
 numpy
+Pillow
+PyMuPDF
+pandas
